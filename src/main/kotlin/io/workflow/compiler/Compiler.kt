@@ -1,0 +1,703 @@
+package io.workflow.compiler
+
+import com.charleskorn.kaml.Yaml
+import com.charleskorn.kaml.AnchorsAndAliases
+import com.charleskorn.kaml.YamlConfiguration
+import com.charleskorn.kaml.YamlException
+import com.charleskorn.kaml.YamlList
+import com.charleskorn.kaml.YamlMap
+import com.charleskorn.kaml.YamlNode
+import com.charleskorn.kaml.YamlNull
+import com.charleskorn.kaml.YamlScalar
+import com.charleskorn.kaml.YamlTaggedNode
+import io.workflow.core.CanonicalValueJson
+import io.workflow.core.ProducerId
+import io.workflow.core.RegisterId
+import io.workflow.core.Value
+import io.workflow.core.ValueSchema
+import io.workflow.core.WorkflowVersionId
+import io.workflow.core.isCompatibleWith
+import java.math.BigDecimal
+import java.math.BigInteger
+import java.security.MessageDigest
+import kotlin.text.Charsets.UTF_8
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+
+data class SourceLocation(val line: Int, val column: Int) {
+    override fun toString() = "$line:$column"
+}
+
+data class Diagnostic(
+    val message: String,
+    val semanticPath: String,
+    val location: SourceLocation,
+) {
+    override fun toString() = "$location $semanticPath: $message"
+}
+
+data class CompilationResult(val ir: WorkflowIrDocument?, val diagnostics: List<Diagnostic>) {
+    val isValid get() = diagnostics.isEmpty() && ir != null
+}
+
+sealed interface Expression {
+    data class Literal(val value: Value) : Expression
+    data class Ref(val root: String, val path: List<PathStep>, val requirement: Requirement) : Expression
+    data class ObjectValue(val fields: Map<String, Expression>) : Expression
+    data class ArrayValue(val items: List<Expression>) : Expression
+    data class Concat(val parts: List<Expression>) : Expression
+    data class Equals(val left: Expression, val right: Expression) : Expression
+    data class Present(val value: Expression) : Expression
+    data class And(val predicates: List<Expression>) : Expression
+    data class Or(val predicates: List<Expression>) : Expression
+    data class Not(val predicate: Expression) : Expression
+}
+
+enum class Requirement { REQUIRED, OPTIONAL }
+sealed interface PathStep {
+    data class Field(val name: String) : PathStep
+    data class Index(val index: Int) : PathStep
+}
+
+data class CompiledRegister(
+    val name: String,
+    val registerId: RegisterId,
+    val producerId: ProducerId,
+    val producer: Expression,
+    val dependencies: List<String>,
+    val schema: ValueSchema,
+    val source: SourceLocation,
+)
+
+data class WorkflowIrDocument(
+    val workflowId: String,
+    val version: Int,
+    val workflowVersionId: WorkflowVersionId,
+    val parameters: Map<String, ValueSchema>,
+    val registers: List<CompiledRegister>,
+    val outputs: List<String>,
+    val contentHash: String,
+    val irVersion: Int = 1,
+) {
+    fun canonicalJson(): String = CanonicalIrJson.document(this, includeHash = true, includeSource = false)
+}
+
+private data class NodeInfo(val node: YamlNode, val path: String) {
+    val location: SourceLocation
+        get() = SourceLocation(node.location.line, node.location.column)
+}
+
+class WorkflowCompiler(
+    private val maxDocumentCodePoints: Int = 1_000_000,
+    private val maxNesting: Int = 64,
+    private val maxAliases: Int = 32,
+) {
+    private var activeYamlLines: List<String> = emptyList()
+
+    init {
+        require(maxDocumentCodePoints > 0) { "maxDocumentCodePoints must be positive" }
+        require(maxNesting > 0) { "maxNesting must be positive" }
+        require(maxAliases >= 0) { "maxAliases must not be negative" }
+    }
+
+    private val yaml = Yaml(
+        configuration = YamlConfiguration(
+            anchorsAndAliases = AnchorsAndAliases.Permitted(maxAliases.toUInt()),
+            codePointLimit = maxDocumentCodePoints,
+        ),
+    )
+
+    @Synchronized
+    fun compile(yamlText: String): CompilationResult {
+        activeYamlLines = emptyList()
+        val diagnostics = mutableListOf<Diagnostic>()
+        preflightNestingLocation(yamlText)?.let {
+            return CompilationResult(null, listOf(Diagnostic("YAML nesting exceeds the limit", "$", it)))
+        }
+        val root = try { yaml.parseToYamlNode(yamlText) } catch (e: Exception) {
+            val location = (e as? YamlException)?.let {
+                SourceLocation(it.line.coerceAtLeast(1), it.column.coerceAtLeast(1))
+            } ?: SourceLocation(1, 1)
+            diagnostics += Diagnostic("invalid YAML: ${e.message ?: "parse error"}", "$", location)
+            return CompilationResult(null, diagnostics)
+        }
+        activeYamlLines = yamlText.lines()
+        validateYamlTree(root, 1, diagnostics)
+        val rootMap = root as? YamlMap ?: run {
+            diagnostics += Diagnostic("document must be a mapping", "$", root.location.source())
+            return CompilationResult(null, diagnostics)
+        }
+        checkFields(rootMap, setOf("workflow"), "$", diagnostics)
+        val workflow = rootMap.get("workflow") as? YamlMap ?: run {
+            diagnostics += Diagnostic("required mapping 'workflow' is missing", "$.workflow", rootMap.location.source())
+            return CompilationResult(null, diagnostics)
+        }
+        checkFields(workflow, setOf("id", "version", "parameters", "context", "outputs"), "$.workflow", diagnostics)
+        val id = stringScalar(workflow, "id", "$.workflow.id", diagnostics)?.takeIf { it.isNotBlank() }
+        val version = integerScalar(workflow, "version", "$.workflow.version", diagnostics)
+        if (version != null && version <= 0) diagnostics += Diagnostic("version must be positive", "$.workflow.version", location(workflow, "version"))
+        val parameters = parseParameters(workflow.get("parameters"), diagnostics)
+        val context = workflow.get("context") as? YamlMap ?: run {
+            diagnostics += Diagnostic("required mapping 'context' is missing", "$.workflow.context", location(workflow, "context"))
+            null
+        }
+        val outputs = parseOutputs(workflow.get("outputs"), diagnostics)
+        if (context == null || id == null || version == null) return CompilationResult(null, diagnostics)
+
+        val definitions = linkedMapOf<String, Pair<YamlNode, Expression>>()
+        context.entries.forEach { (key, node) ->
+            val name = key.content
+            val path = "$.workflow.context.$name"
+            if (!name.matches(Regex("[A-Za-z_][A-Za-z0-9_-]*"))) {
+                diagnostics += Diagnostic("register name is not a valid identifier", path, key.location.source())
+            }
+            if (name in RESERVED_ROOTS) diagnostics += Diagnostic("register name '$name' is reserved", path, key.location.source())
+            if (name in definitions) diagnostics += Diagnostic("duplicate register definition '$name'", path, key.location.source())
+            val producerFields = (node as? YamlMap)?.entries?.keys?.map { it.content }.orEmpty()
+            producerFields.firstOrNull { it == "provider" || it == "match" || it == "map" }?.let {
+                diagnostics += Diagnostic("producer form '$it' is not supported by the expression-only compiler", "$path.$it", node.location.source())
+            }
+            val expr = parseExpression(node, path, diagnostics)
+            if (expr != null && name !in definitions) definitions[name] = node to expr
+        }
+        val schemaExplicit = mutableMapOf<String, ValueSchema>()
+        val registers = mutableListOf<CompiledRegister>()
+        val names = definitions.keys
+        val depsByName = definitions.mapValues { (_, pair) -> dependencies(pair.second).filter { it in names }.distinct().sorted() }
+        detectCycles(depsByName, diagnostics, definitions)
+        val inferred = mutableMapOf<String, ValueSchema>()
+        val inferring = mutableSetOf<String>()
+        fun inferRegister(name: String): ValueSchema {
+            inferred[name]?.let { return it }
+            if (!inferring.add(name)) return ValueSchema.Any
+            val (node, expression) = definitions.getValue(name)
+            depsByName[name].orEmpty().forEach { inferRegister(it) }
+            val schema = inferExpression(expression, parameters, inferred, definitions.keys, emptySet(), diagnostics, "$.workflow.context.$name", node.location.source())
+            inferred[name] = schema
+            inferring -= name
+            return schema
+        }
+        definitions.forEach { (name, pair) ->
+            val explicit = parseEmbeddedSchema(pair.first, "$.workflow.context.$name.schema", diagnostics)
+            if (explicit != null) schemaExplicit[name] = explicit
+            val inferredSchema = inferRegister(name)
+            val schema = explicit ?: inferredSchema
+            if (explicit != null && !inferredSchema.isCompatibleWith(explicit)) {
+                diagnostics += Diagnostic("expression schema ${schemaName(inferredSchema)} is incompatible with declared ${schemaName(explicit)}", "$.workflow.context.$name.schema", pair.first.location.source())
+            }
+            val identityPrefix = "$id@$version"
+            registers += CompiledRegister(
+                name = name,
+                registerId = RegisterId("$identityPrefix/register/$name"),
+                producerId = ProducerId("$identityPrefix/producer/$name"),
+                producer = pair.second,
+                dependencies = depsByName[name].orEmpty(),
+                schema = schema,
+                source = pair.first.location.source(),
+            )
+        }
+        outputs.forEachIndexed { index, output ->
+            if (output !in definitions) diagnostics += Diagnostic("output '$output' is unreachable because no such register is defined", "$.workflow.outputs[$index]", location(workflow, "outputs"))
+        }
+        if (diagnostics.isNotEmpty()) return CompilationResult(null, diagnostics)
+        val withoutHash = WorkflowIrDocument(
+            workflowId = id,
+            version = version,
+            workflowVersionId = WorkflowVersionId("$id@$version"),
+            parameters = parameters.toSortedMap(),
+            registers = registers.sortedBy { it.name },
+            outputs = outputs,
+            contentHash = "",
+        )
+        val hash = sha256(CanonicalIrJson.document(withoutHash, includeHash = false, includeSource = false))
+        return CompilationResult(withoutHash.copy(contentHash = hash), emptyList())
+    }
+
+    private fun parseParameters(node: YamlNode?, diagnostics: MutableList<Diagnostic>): Map<String, ValueSchema> {
+        val map = node as? YamlMap ?: return if (node == null) emptyMap() else run { diagnostics += Diagnostic("parameters must be a mapping", "$.workflow.parameters", node.location.source()); emptyMap() }
+        val result = linkedMapOf<String, ValueSchema>()
+        map.entries.forEach { (key, value) ->
+            val path = "$.workflow.parameters.${key.content}"
+            val entry = value as? YamlMap ?: run { diagnostics += Diagnostic("parameter declaration must be a mapping", path, value.location.source()); return@forEach }
+            checkFields(entry, setOf("schema"), path, diagnostics)
+            val schema = parseSchema(entry.get("schema"), "$path.schema", diagnostics)
+            if (schema != null) result[key.content] = schema
+        }
+        return result
+    }
+
+    private fun parseOutputs(node: YamlNode?, diagnostics: MutableList<Diagnostic>): List<String> {
+        val list = node as? YamlList ?: return if (node == null) run { diagnostics += Diagnostic("required list 'outputs' is missing", "$.workflow.outputs", SourceLocation(1, 1)); emptyList() } else run { diagnostics += Diagnostic("outputs must be a list", "$.workflow.outputs", node.location.source()); emptyList() }
+        val outputs = list.items.mapIndexedNotNull { i, item ->
+            val output = (item as? YamlScalar)?.content
+            if (output == null) diagnostics += Diagnostic("output name must be a string", "$.workflow.outputs[$i]", item.location.source())
+            else if (!output.matches(Regex("[A-Za-z_][A-Za-z0-9_-]*"))) diagnostics += Diagnostic("output name is not a valid identifier", "$.workflow.outputs[$i]", item.location.source())
+            output
+        }
+        outputs.groupingBy { it }.eachCount().filterValues { it > 1 }.keys.forEach {
+            diagnostics += Diagnostic("duplicate output '$it'", "$.workflow.outputs", node.location.source())
+        }
+        return outputs
+    }
+
+    private fun parseExpression(node: YamlNode, path: String, diagnostics: MutableList<Diagnostic>): Expression? {
+        return when (node) {
+            is YamlNull -> Expression.Literal(Value.Null)
+            is YamlScalar -> Expression.Literal(scalarValue(node))
+            is YamlList -> Expression.ArrayValue(node.items.mapIndexedNotNull { i, item -> parseExpression(item, "$path[$i]", diagnostics) })
+            is YamlMap -> {
+                val keys = node.entries.keys.map { it.content }
+                val operators = keys.filter { it.startsWith("$") }
+                if (operators.isNotEmpty()) {
+                    if (keys.filterNot { it == "schema" }.size != 1) { diagnostics += Diagnostic("an expression mapping must contain exactly one operator", path, node.location.source()); return null }
+                    val op = operators.single()
+                    val value: YamlNode = node.get<YamlNode>(op)!!
+                    when (op) {
+                        "\$ref", "\$optional" -> {
+                            val ref = (value as? YamlScalar)?.content
+                            if (ref == null) { diagnostics += Diagnostic("$op requires a string JSONPath", path, value.location.source()); null }
+                            else parseRef(ref, if (op == "\$ref") Requirement.REQUIRED else Requirement.OPTIONAL, path, value.location.source(), diagnostics)
+                        }
+                        "\$concat" -> parseExpressionList(value, op, path, diagnostics) { Expression.Concat(it) }
+                        "\$eq" -> parseFixedExpressionList(value, op, 2, path, diagnostics) { Expression.Equals(it[0], it[1]) }
+                        "\$present" -> parseExpression(value, "$path.$op", diagnostics)?.let(Expression::Present)
+                        "\$and" -> parseExpressionList(value, op, path, diagnostics) { Expression.And(it) }
+                        "\$or" -> parseExpressionList(value, op, path, diagnostics) { Expression.Or(it) }
+                        "\$not" -> parseExpression(value, "$path.$op", diagnostics)?.let(Expression::Not)
+                        "\$literal" -> Expression.Literal(rawValue(value))
+                        else -> { diagnostics += Diagnostic("unknown expression operator '$op'", path, node.location.source()); null }
+                    }
+                } else Expression.ObjectValue(node.entries.entries.associate { (key, value) -> key.content to (parseExpression(value, "$path.${key.content}", diagnostics) ?: Expression.Literal(Value.Null)) })
+            }
+            else -> { diagnostics += Diagnostic("custom YAML tags are not permitted", path, node.location.source()); null }
+        }
+    }
+
+    private fun parseExpressionList(node: YamlNode, op: String, path: String, diagnostics: MutableList<Diagnostic>, make: (List<Expression>) -> Expression): Expression? {
+        val list = node as? YamlList ?: run { diagnostics += Diagnostic("$op requires a list", path, node.location.source()); return null }
+        return make(list.items.mapIndexedNotNull { i, item -> parseExpression(item, "$path[$i]", diagnostics) })
+    }
+
+    private fun parseFixedExpressionList(node: YamlNode, op: String, count: Int, path: String, diagnostics: MutableList<Diagnostic>, make: (List<Expression>) -> Expression): Expression? {
+        val list = node as? YamlList ?: run { diagnostics += Diagnostic("$op requires a list of $count expressions", path, node.location.source()); return null }
+        if (list.items.size != count) { diagnostics += Diagnostic("$op requires exactly $count expressions", path, node.location.source()); return null }
+        val expressions = list.items.mapIndexedNotNull { i, item -> parseExpression(item, "$path[$i]", diagnostics) }
+        return if (expressions.size == count) make(expressions) else null
+    }
+
+    private fun parseRef(text: String, requirement: Requirement, path: String, source: SourceLocation, diagnostics: MutableList<Diagnostic>): Expression? {
+        if (!text.startsWith("$")) { diagnostics += Diagnostic("reference must use a singular JSONPath rooted at '$'", path, source); return null }
+        val body = text.substring(1)
+        if (body.isEmpty() || body.contains("..") || body.contains("*") || body.contains("?") || body.contains(":") || body.contains("{")) {
+            diagnostics += Diagnostic("reference path must be singular (wildcards, filters, slices, and recursive descent are not supported)", path, source); return null
+        }
+        val parts = mutableListOf<PathStep>()
+        var i = 0
+        fun readField(): String? {
+            val start = i
+            while (i < body.length && (body[i].isLetterOrDigit() || body[i] == '_' || body[i] == '-')) i++
+            return body.substring(start, i).takeIf { it.isNotEmpty() }
+        }
+        val root: String
+        if (body.startsWith(".")) {
+            i = 1
+            root = readField() ?: run { diagnostics += Diagnostic("invalid singular reference path '$text'", path, source); return null }
+        } else if (body.startsWith("[")) {
+            val end = body.indexOf(']')
+            val token = if (end > 0) body.substring(1, end) else ""
+            if (token.length < 2 || (token.first() != '\'' && token.first() != '"') || token.last() != token.first()) {
+                diagnostics += Diagnostic("reference root must be a field selector", path, source); return null
+            }
+            root = token.substring(1, token.length - 1)
+            i = end + 1
+        } else {
+            diagnostics += Diagnostic("invalid singular reference path '$text'", path, source); return null
+        }
+        while (i < body.length) {
+            when (body[i]) {
+                '.' -> { i++; val field = readField() ?: run { diagnostics += Diagnostic("invalid field selector in reference '$text'", path, source); return null }; parts += PathStep.Field(field) }
+                '[' -> {
+                    val end = body.indexOf(']', i)
+                    if (end < 0) { diagnostics += Diagnostic("unterminated path selector in '$text'", path, source); return null }
+                    val token = body.substring(i + 1, end)
+                    when {
+                        token.matches(Regex("[0-9]+")) -> {
+                            val index = token.toIntOrNull()
+                            if (index == null) { diagnostics += Diagnostic("path index is too large", path, source); return null }
+                            parts += PathStep.Index(index)
+                        }
+                        token.length >= 2 && token.first() == '\'' && token.last() == '\'' -> parts += PathStep.Field(token.substring(1, token.length - 1))
+                        token.length >= 2 && token.first() == '"' && token.last() == '"' -> parts += PathStep.Field(token.substring(1, token.length - 1))
+                        else -> { diagnostics += Diagnostic("non-singular or invalid path selector '$token'", path, source); return null }
+                    }
+                    i = end + 1
+                }
+                else -> { diagnostics += Diagnostic("invalid reference path '$text'", path, source); return null }
+            }
+        }
+        return Expression.Ref(root, parts, requirement)
+    }
+
+    private fun parseSchema(node: YamlNode?, path: String, diagnostics: MutableList<Diagnostic>): ValueSchema? {
+        if (node == null) { diagnostics += Diagnostic("schema is required", path, SourceLocation(1, 1)); return null }
+        if (node is YamlNull) return ValueSchema.Null
+        if (node is YamlScalar) return when (node.content) {
+            "any" -> ValueSchema.Any; "null" -> ValueSchema.Null; "boolean" -> ValueSchema.Boolean; "string" -> ValueSchema.String; "integer" -> ValueSchema.Integer; "decimal" -> ValueSchema.Decimal
+            else -> { diagnostics += Diagnostic("unknown schema '${node.content}'", path, node.location.source()); null }
+        }
+        val map = node as? YamlMap ?: run { diagnostics += Diagnostic("schema must be a scalar or mapping", path, node.location.source()); return null }
+        val type = (map.get("type") as? YamlScalar)?.content ?: run { diagnostics += Diagnostic("composite schema requires a type", path, node.location.source()); return null }
+        return when (type) {
+            "array" -> { checkFields(map, setOf("type", "items"), path, diagnostics); parseSchema(map.get("items"), "$path.items", diagnostics)?.let(ValueSchema::Array) }
+            "object" -> {
+                checkFields(map, setOf("type", "fields", "additional-fields"), path, diagnostics)
+                val fieldsNode = map.get("fields") as? YamlMap ?: run { diagnostics += Diagnostic("object schema requires fields", "$path.fields", location(map, "fields")); return null }
+                val fields = fieldsNode.entries.mapNotNull { (key, value) ->
+                    val fieldMap = value as? YamlMap ?: run { diagnostics += Diagnostic("object field schema must be a mapping", "$path.fields.${key.content}", value.location.source()); return@mapNotNull null }
+                    checkFields(fieldMap, setOf("schema", "required"), "$path.fields.${key.content}", diagnostics)
+                    val fieldSchema = parseSchema(fieldMap.get("schema"), "$path.fields.${key.content}.schema", diagnostics) ?: return@mapNotNull null
+                    val required = parseBoolean(fieldMap.get("required"), "$path.fields.${key.content}.required", true, diagnostics)
+                    key.content to ValueSchema.Object.Field(fieldSchema, required)
+                }.toMap()
+                val additional = parseBoolean(map.get("additional-fields"), "$path.additional-fields", false, diagnostics)
+                ValueSchema.Object(fields, additional)
+            }
+            "tagged-union" -> parseTaggedUnionSchema(map, path, diagnostics)
+            else -> { diagnostics += Diagnostic("unknown schema type '$type'", path, node.location.source()); null }
+        }
+    }
+
+    private fun parseEmbeddedSchema(node: YamlNode, path: String, diagnostics: MutableList<Diagnostic>): ValueSchema? {
+        val map = node as? YamlMap ?: return null
+        if (map.entries.keys.none { it.content.startsWith("$") }) return null
+        val schemaNode: YamlNode? = map.get<YamlNode>("schema")
+        return schemaNode?.let { parseSchema(it, path, diagnostics) }
+    }
+
+    private fun inferExpression(expression: Expression, parameters: Map<String, ValueSchema>, inferred: Map<String, ValueSchema>, registers: Set<String>, lexical: Set<String>, diagnostics: MutableList<Diagnostic>, path: String, source: SourceLocation): ValueSchema = when (expression) {
+        is Expression.Literal -> valueSchema(expression.value)
+        is Expression.Ref -> {
+            val rootSchema = when {
+                expression.root == "parameters" -> ValueSchema.Object(parameters.mapValues { ValueSchema.Object.Field(it.value) })
+                expression.root in registers -> inferred[expression.root] ?: ValueSchema.Any
+                expression.root in lexical -> ValueSchema.Any
+                else -> { diagnostics += Diagnostic("unknown reference root '${expression.root}'", path, source); ValueSchema.Any }
+            }
+            pathSchema(rootSchema, expression.path, path, diagnostics, source)
+        }
+        is Expression.ObjectValue -> ValueSchema.Object(expression.fields.mapValues { ValueSchema.Object.Field(inferExpression(it.value, parameters, inferred, registers, lexical, diagnostics, path, source)) })
+        is Expression.ArrayValue -> {
+            val schemas = expression.items.map { inferExpression(it, parameters, inferred, registers, lexical, diagnostics, path, source) }
+            ValueSchema.Array(schemas.distinct().singleOrNull() ?: ValueSchema.Any)
+        }
+        is Expression.Concat -> {
+            expression.parts.forEach { part ->
+                val partSchema = inferExpression(part, parameters, inferred, registers, lexical, diagnostics, path, source)
+                if (partSchema != ValueSchema.String) diagnostics += Diagnostic("\$concat operands must have string schemas", path, source)
+            }
+            ValueSchema.String
+        }
+        is Expression.Equals -> {
+            inferExpression(expression.left, parameters, inferred, registers, lexical, diagnostics, path, source)
+            inferExpression(expression.right, parameters, inferred, registers, lexical, diagnostics, path, source)
+            ValueSchema.Boolean
+        }
+        is Expression.Present -> {
+            inferExpression(expression.value, parameters, inferred, registers, lexical, diagnostics, path, source)
+            if (expression.value !is Expression.Ref || expression.value.requirement != Requirement.OPTIONAL) {
+                diagnostics += Diagnostic("\$present requires an optional reference", path, source)
+            }
+            ValueSchema.Boolean
+        }
+        is Expression.And -> { expression.predicates.forEach { requireBoolean(it, parameters, inferred, registers, lexical, diagnostics, path, source, "\$and") }; ValueSchema.Boolean }
+        is Expression.Or -> { expression.predicates.forEach { requireBoolean(it, parameters, inferred, registers, lexical, diagnostics, path, source, "\$or") }; ValueSchema.Boolean }
+        is Expression.Not -> { requireBoolean(expression.predicate, parameters, inferred, registers, lexical, diagnostics, path, source, "\$not"); ValueSchema.Boolean }
+    }
+
+    private fun pathSchema(start: ValueSchema, pathSteps: List<PathStep>, path: String, diagnostics: MutableList<Diagnostic>, source: SourceLocation): ValueSchema {
+        var current = start
+        pathSteps.forEach { step ->
+            current = when (step) {
+                is PathStep.Field -> when (current) { is ValueSchema.Object -> current.fields[step.name]?.schema ?: run { diagnostics += Diagnostic("path field '${step.name}' is not present in the schema", path, source); ValueSchema.Any }; ValueSchema.Any -> ValueSchema.Any; else -> { diagnostics += Diagnostic("field selector cannot be applied to ${schemaName(current)}", path, source); ValueSchema.Any } }
+                is PathStep.Index -> when (current) { is ValueSchema.Array -> current.items; ValueSchema.Any -> ValueSchema.Any; else -> { diagnostics += Diagnostic("index selector cannot be applied to ${schemaName(current)}", path, source); ValueSchema.Any } }
+            }
+        }
+        return current
+    }
+
+    private fun dependencies(expression: Expression): List<String> = when (expression) {
+        is Expression.Ref -> if (expression.root != "parameters" && expression.root != "item" && expression.root != "key" && expression.root != "match") listOf(expression.root) else emptyList()
+        is Expression.ObjectValue -> expression.fields.values.flatMap(::dependencies)
+        is Expression.ArrayValue -> expression.items.flatMap(::dependencies)
+        is Expression.Concat -> expression.parts.flatMap(::dependencies)
+        is Expression.Equals -> dependencies(expression.left) + dependencies(expression.right)
+        is Expression.Present -> dependencies(expression.value)
+        is Expression.And -> expression.predicates.flatMap(::dependencies)
+        is Expression.Or -> expression.predicates.flatMap(::dependencies)
+        is Expression.Not -> dependencies(expression.predicate)
+        is Expression.Literal -> emptyList()
+    }
+
+    private fun detectCycles(deps: Map<String, List<String>>, diagnostics: MutableList<Diagnostic>, definitions: Map<String, Pair<YamlNode, Expression>>) {
+        val visiting = mutableSetOf<String>(); val visited = mutableSetOf<String>()
+        fun visit(name: String, stack: List<String>) {
+            if (name in visiting) { diagnostics += Diagnostic("dependency cycle: ${(stack + name).joinToString(" -> ")}", "$.workflow.context.$name", definitions[name]?.first?.location?.source() ?: SourceLocation(1, 1)); return }
+            if (!visited.add(name)) return
+            visiting += name
+            deps[name].orEmpty().forEach { visit(it, stack + name) }
+            visiting -= name
+        }
+        deps.keys.forEach { visit(it, emptyList()) }
+    }
+
+    private fun checkFields(map: YamlMap, allowed: Set<String>, path: String, diagnostics: MutableList<Diagnostic>) {
+        map.entries.forEach { (key, _) -> if (key.content !in allowed) diagnostics += Diagnostic("unknown field '${key.content}'", "$path.${key.content}", key.location.source()) }
+    }
+    private fun validateYamlTree(node: YamlNode, depth: Int, diagnostics: MutableList<Diagnostic>) {
+        if (depth > maxNesting) {
+            diagnostics += Diagnostic("YAML nesting exceeds the limit", "$", node.location.source())
+            return
+        }
+        when (node) {
+            is YamlTaggedNode -> diagnostics += Diagnostic("custom YAML tags are not permitted", "$", node.location.source())
+            is YamlScalar -> if (!isExplicitString(node) && node.content.lowercase() in NON_FINITE_NUMBERS) {
+                diagnostics += Diagnostic("non-finite decimals are not supported", "$", node.location.source())
+            }
+            is YamlList -> node.items.forEach { validateYamlTree(it, depth + 1, diagnostics) }
+            is YamlMap -> node.entries.forEach { (key, value) ->
+                validateYamlTree(key, depth + 1, diagnostics)
+                validateYamlTree(value, depth + 1, diagnostics)
+            }
+            else -> Unit
+        }
+    }
+
+    private fun preflightNestingLocation(yamlText: String): SourceLocation? {
+        val indentationLevels = mutableListOf<Int>()
+        var flowDepth = 0
+        var blockScalarParentIndent: Int? = null
+        yamlText.lineSequence().forEachIndexed { lineIndex, rawLine ->
+            if (rawLine.isBlank() || rawLine.trimStart().startsWith("#")) return@forEachIndexed
+            val indentation = rawLine.indexOfFirst { !it.isWhitespace() }.coerceAtLeast(0)
+            blockScalarParentIndent?.let { parentIndent ->
+                if (indentation > parentIndent) return@forEachIndexed
+                blockScalarParentIndent = null
+            }
+            while (indentationLevels.isNotEmpty() && indentation <= indentationLevels.last()) {
+                indentationLevels.removeAt(indentationLevels.lastIndex)
+            }
+            indentationLevels += indentation
+
+            val trimmed = rawLine.substring(indentation)
+            var sequenceDepth = 0
+            var sequenceOffset = 0
+            while (trimmed.startsWith("- ", sequenceOffset)) {
+                sequenceDepth++
+                sequenceOffset += 2
+            }
+            if (indentationLevels.size + sequenceDepth + flowDepth > maxNesting) {
+                return SourceLocation(lineIndex + 1, indentation + 1)
+            }
+
+            var quote: Char? = null
+            var escaped = false
+            for (column in trimmed.indices) {
+                val character = trimmed[column]
+                if (quote == '"' && escaped) {
+                    escaped = false
+                    continue
+                }
+                if (quote == '"' && character == '\\') {
+                    escaped = true
+                    continue
+                }
+                if (quote != null) {
+                    if (character == quote) quote = null
+                    continue
+                }
+                if (character == '#' && (column == 0 || trimmed[column - 1].isWhitespace())) break
+                if (character == '\'' || character == '"') quote = character
+                else if (character == '[' || character == '{') {
+                    flowDepth++
+                    if (indentationLevels.size + sequenceDepth + flowDepth > maxNesting) {
+                        return SourceLocation(lineIndex + 1, indentation + column + 1)
+                    }
+                }
+                else if (character == ']' || character == '}') flowDepth = (flowDepth - 1).coerceAtLeast(0)
+            }
+            val contentWithoutComment = trimmed.substringBefore(" #").trimEnd()
+            if (Regex("[|>][+-]?$" ).containsMatchIn(contentWithoutComment)) {
+                blockScalarParentIndent = indentation
+            }
+        }
+        return null
+    }
+
+    private fun parseBoolean(node: YamlNode?, path: String, default: Boolean, diagnostics: MutableList<Diagnostic>): Boolean {
+        if (node == null) return default
+        val value = (node as? YamlScalar)?.let(::scalarValue) as? Value.BooleanValue
+        if (value == null) diagnostics += Diagnostic("value must be a Boolean", path, node.location.source())
+        return value?.value ?: default
+    }
+
+    private fun parseTaggedUnionSchema(map: YamlMap, path: String, diagnostics: MutableList<Diagnostic>): ValueSchema? {
+        checkFields(map, setOf("type", "discriminator", "variants"), path, diagnostics)
+        val discriminator = (map.get("discriminator") as? YamlScalar)?.content ?: run {
+            diagnostics += Diagnostic("tagged-union schema requires a discriminator", "$path.discriminator", location(map, "discriminator"))
+            return null
+        }
+        val variantsNode = map.get("variants") as? YamlMap ?: run {
+            diagnostics += Diagnostic("tagged-union schema requires variants", "$path.variants", location(map, "variants"))
+            return null
+        }
+        val variants = variantsNode.entries.mapNotNull { (key, value) ->
+            val variant = parseSchema(value, "$path.variants.${key.content}", diagnostics)
+            if (variant !is ValueSchema.Object) {
+                diagnostics += Diagnostic("tagged-union variants must be object schemas", "$path.variants.${key.content}", value.location.source())
+                null
+            } else {
+                val discriminatorField = variant.fields[discriminator]
+                if (discriminatorField?.schema != ValueSchema.String || !discriminatorField.required) {
+                    diagnostics += Diagnostic(
+                        "tagged-union variant must require string discriminator '$discriminator'",
+                        "$path.variants.${key.content}.fields.$discriminator",
+                        value.location.source(),
+                    )
+                }
+                key.content to variant
+            }
+        }.toMap()
+        if (variants.isEmpty()) diagnostics += Diagnostic("tagged-union schema requires at least one variant", "$path.variants", variantsNode.location.source())
+        return ValueSchema.TaggedUnion(discriminator, variants)
+    }
+
+    private fun requireBoolean(expression: Expression, parameters: Map<String, ValueSchema>, inferred: Map<String, ValueSchema>, registers: Set<String>, lexical: Set<String>, diagnostics: MutableList<Diagnostic>, path: String, source: SourceLocation, operator: String) {
+        val schema = inferExpression(expression, parameters, inferred, registers, lexical, diagnostics, path, source)
+        if (schema != ValueSchema.Boolean) diagnostics += Diagnostic("$operator operands must have boolean schemas", path, source)
+    }
+    private fun stringScalar(map: YamlMap, key: String, path: String, diagnostics: MutableList<Diagnostic>): String? {
+        val node = map.get(key) as? YamlScalar
+        val value = node?.let(::scalarValue) as? Value.StringValue
+        if (value == null) diagnostics += Diagnostic("$key must be a string", path, location(map, key))
+        return value?.value
+    }
+    private fun integerScalar(map: YamlMap, key: String, path: String, diagnostics: MutableList<Diagnostic>): Int? {
+        val node = map.get(key) as? YamlScalar
+        val integer = node?.let(::scalarValue) as? Value.IntegerValue
+        val value = integer?.value?.toIntExactOrNull()
+        if (value == null) diagnostics += Diagnostic("$key must be an integer", path, location(map, key))
+        return value
+    }
+    private fun location(map: YamlMap, key: String): SourceLocation = (map.entries.entries.firstOrNull { it.key.content == key }?.value ?: map).location.source()
+    private fun valueSchema(value: Value): ValueSchema = when (value) {
+        Value.Null -> ValueSchema.Null
+        is Value.BooleanValue -> ValueSchema.Boolean
+        is Value.StringValue -> ValueSchema.String
+        is Value.IntegerValue -> ValueSchema.Integer
+        is Value.DecimalValue -> ValueSchema.Decimal
+        is Value.ArrayValue -> ValueSchema.Array(value.values.map(::valueSchema).distinct().singleOrNull() ?: ValueSchema.Any)
+        is Value.ObjectValue -> ValueSchema.Object(value.fields.mapValues { ValueSchema.Object.Field(valueSchema(it.value)) })
+        is Value.TaggedValue -> ValueSchema.Any
+    }
+    private fun scalarValue(node: YamlScalar): Value {
+        val text = node.content
+        if (isExplicitString(node)) return Value.StringValue(text)
+        return when {
+            text in setOf("null", "Null", "NULL", "~") -> Value.Null
+            text in setOf("true", "True", "TRUE") -> Value.BooleanValue(true)
+            text in setOf("false", "False", "FALSE") -> Value.BooleanValue(false)
+            text.matches(DECIMAL_INTEGER) -> Value.IntegerValue(BigInteger(text))
+            text.matches(OCTAL_INTEGER) -> Value.IntegerValue(BigInteger(text.removePrefix("+").removePrefix("0o").let { if (it.startsWith("-0o")) "-${it.removePrefix("-0o")}" else it }, 8))
+            text.matches(HEXADECIMAL_INTEGER) -> Value.IntegerValue(BigInteger(text.removePrefix("+").removePrefix("0x").let { if (it.startsWith("-0x")) "-${it.removePrefix("-0x")}" else it }, 16))
+            text.matches(DECIMAL_NUMBER) -> Value.DecimalValue(BigDecimal(text))
+            else -> Value.StringValue(text)
+        }
+    }
+    private fun isExplicitString(node: YamlScalar): Boolean {
+        val line = activeYamlLines.getOrNull(node.location.line - 1).orEmpty()
+        val at = (node.location.column - 1).coerceIn(0, line.length)
+        return line.getOrNull(at) in setOf('\'', '"', '|', '>')
+    }
+    private fun rawValue(node: YamlNode): Value = when (node) { is YamlNull -> Value.Null; is YamlScalar -> scalarValue(node); is YamlList -> Value.ArrayValue(node.items.map { rawValue(it) }); is YamlMap -> Value.ObjectValue(node.entries.map { it.key.content to rawValue(it.value) }.toMap()); else -> Value.StringValue(node.contentToString()) }
+    private fun schemaName(schema: ValueSchema): String = when (schema) { ValueSchema.Any -> "any"; ValueSchema.Null -> "null"; ValueSchema.Boolean -> "boolean"; ValueSchema.String -> "string"; ValueSchema.Integer -> "integer"; ValueSchema.Decimal -> "decimal"; is ValueSchema.Array -> "array"; is ValueSchema.Object -> "object"; is ValueSchema.TaggedUnion -> "tagged-union" }
+
+    private companion object {
+        val RESERVED_ROOTS = setOf("parameters", "item", "key", "match")
+        val NON_FINITE_NUMBERS = setOf(".inf", "+.inf", "-.inf", ".nan")
+        val DECIMAL_INTEGER = Regex("[-+]?[0-9]+")
+        val OCTAL_INTEGER = Regex("[-+]?0o[0-7]+")
+        val HEXADECIMAL_INTEGER = Regex("[-+]?0x[0-9a-fA-F]+")
+        val DECIMAL_NUMBER = Regex("[-+]?(?:(?:[0-9]+(?:\\.[0-9]*)?|\\.[0-9]+)(?:[eE][-+]?[0-9]+)?)")
+    }
+}
+
+private fun BigInteger.toIntExactOrNull(): Int? = try {
+    intValueExact()
+} catch (_: ArithmeticException) {
+    null
+}
+
+private fun com.charleskorn.kaml.Location.source() = SourceLocation(line, column)
+
+private fun sha256(text: String): String = MessageDigest.getInstance("SHA-256").digest(text.toByteArray(UTF_8)).joinToString("") { "%02x".format(it) }
+
+private object CanonicalIrJson {
+    fun document(doc: WorkflowIrDocument, includeHash: Boolean, includeSource: Boolean): String {
+        val fields = linkedMapOf<String, JsonElement>(
+            "irVersion" to JsonPrimitive(doc.irVersion),
+            "workflowId" to JsonPrimitive(doc.workflowId),
+            "version" to JsonPrimitive(doc.version),
+            "workflowVersionId" to JsonPrimitive(doc.workflowVersionId.value),
+            "parameters" to JsonObject(doc.parameters.toSortedMap().mapValues { schema(it.value) }),
+            "registers" to JsonArray(doc.registers.sortedBy { it.name }.map { register(it, includeSource) }),
+            "outputs" to JsonArray(doc.outputs.map(::JsonPrimitive)),
+        )
+        if (includeHash) fields["contentHash"] = JsonPrimitive(doc.contentHash)
+        return JsonObject(fields.toSortedMap()).toString()
+    }
+    private fun register(register: CompiledRegister, includeSource: Boolean): JsonElement = JsonObject(linkedMapOf(
+        "name" to JsonPrimitive(register.name),
+        "registerId" to JsonPrimitive(register.registerId.value),
+        "producerId" to JsonPrimitive(register.producerId.value),
+        "dependencies" to JsonArray(register.dependencies.sorted().map(::JsonPrimitive)),
+        "schema" to schema(register.schema),
+        "producer" to expression(register.producer),
+        *(if (includeSource) arrayOf("source" to JsonObject(mapOf("line" to JsonPrimitive(register.source.line), "column" to JsonPrimitive(register.source.column)))) else emptyArray()),
+    ).toSortedMap())
+    private fun expression(expression: Expression): JsonElement = when (expression) {
+        is Expression.Literal -> JsonObject(mapOf("kind" to JsonPrimitive("literal"), "value" to jsonValue(expression.value)))
+        is Expression.Ref -> JsonObject(mapOf(
+            "kind" to JsonPrimitive("ref"),
+            "root" to JsonPrimitive(expression.root),
+            "path" to JsonArray(expression.path.map(::pathStep)),
+            "requirement" to JsonPrimitive(expression.requirement.name.lowercase()),
+        ))
+        is Expression.ObjectValue -> JsonObject(mapOf("kind" to JsonPrimitive("object"), "fields" to JsonObject(expression.fields.toSortedMap().mapValues { expression(it.value) })))
+        is Expression.ArrayValue -> JsonObject(mapOf("kind" to JsonPrimitive("array"), "items" to JsonArray(expression.items.map(::expression))))
+        is Expression.Concat -> JsonObject(mapOf("kind" to JsonPrimitive("concat"), "parts" to JsonArray(expression.parts.map(::expression))))
+        is Expression.Equals -> JsonObject(mapOf("kind" to JsonPrimitive("equals"), "left" to expression(expression.left), "right" to expression(expression.right)))
+        is Expression.Present -> JsonObject(mapOf("kind" to JsonPrimitive("present"), "value" to expression(expression.value)))
+        is Expression.And -> JsonObject(mapOf("kind" to JsonPrimitive("and"), "predicates" to JsonArray(expression.predicates.map(::expression))))
+        is Expression.Or -> JsonObject(mapOf("kind" to JsonPrimitive("or"), "predicates" to JsonArray(expression.predicates.map(::expression))))
+        is Expression.Not -> JsonObject(mapOf("kind" to JsonPrimitive("not"), "predicate" to expression(expression.predicate)))
+    }
+    private fun schema(schema: ValueSchema): JsonElement = when (schema) {
+        ValueSchema.Any -> JsonPrimitive("any"); ValueSchema.Null -> JsonPrimitive("null"); ValueSchema.Boolean -> JsonPrimitive("boolean"); ValueSchema.String -> JsonPrimitive("string"); ValueSchema.Integer -> JsonPrimitive("integer"); ValueSchema.Decimal -> JsonPrimitive("decimal")
+        is ValueSchema.Array -> JsonObject(mapOf("type" to JsonPrimitive("array"), "items" to schema(schema.items)))
+        is ValueSchema.Object -> JsonObject(mapOf("type" to JsonPrimitive("object"), "fields" to JsonObject(schema.fields.toSortedMap().mapValues { JsonObject(mapOf("schema" to schema(it.value.schema), "required" to JsonPrimitive(it.value.required))) }), "additional-fields" to JsonPrimitive(schema.additionalFields)))
+        is ValueSchema.TaggedUnion -> JsonObject(mapOf(
+            "type" to JsonPrimitive("tagged-union"),
+            "discriminator" to JsonPrimitive(schema.discriminator),
+            "variants" to JsonObject(schema.variants.toSortedMap().mapValues { schema(it.value) }),
+        ))
+    }
+    private fun pathStep(step: PathStep): JsonElement = when (step) {
+        is PathStep.Field -> JsonObject(mapOf("kind" to JsonPrimitive("field"), "name" to JsonPrimitive(step.name)))
+        is PathStep.Index -> JsonObject(mapOf("kind" to JsonPrimitive("index"), "index" to JsonPrimitive(step.index)))
+    }
+    private fun jsonValue(value: Value): JsonElement = Json.parseToJsonElement(CanonicalValueJson.encode(value))
+}

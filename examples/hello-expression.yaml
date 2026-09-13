@@ -1,0 +1,16 @@
+workflow:
+  id: hello-expression
+  version: 1
+  parameters:
+    name:
+      schema: string
+  context:
+    greeting:
+      $concat:
+        - "Hello, "
+        - {$ref: "$.parameters.name"}
+        - "!"
+    greeting-copy:
+      $ref: "$.greeting"
+  outputs:
+    - greeting-copy
