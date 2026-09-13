@@ -14,7 +14,6 @@ import io.workflow.core.ActivationIntentId
 import io.workflow.core.AttemptId
 import io.workflow.core.Clock
 import io.workflow.core.ContextId
-import io.workflow.core.DeterministicIdSource
 import io.workflow.core.EmissionId
 import io.workflow.core.ExecutionId
 import io.workflow.core.IdSource
@@ -24,13 +23,12 @@ import io.workflow.core.JournalBatchId
 import io.workflow.core.ProducerId
 import io.workflow.core.RegisterId
 import io.workflow.core.SystemClock
+import io.workflow.core.UuidIdSource
 import io.workflow.core.Value
 import io.workflow.core.WorkflowId
 import io.workflow.core.WorkflowVersionId
 import io.workflow.core.CanonicalValueJson
 import io.workflow.core.validate
-import java.math.BigDecimal
-import java.math.BigInteger
 import java.security.MessageDigest
 import java.time.Instant
 import kotlinx.serialization.json.JsonArray
@@ -58,6 +56,9 @@ data class JournalBatchProposal(
 data class ActivationRecord(
     val activationId: ActivationId,
     val intentId: ActivationIntentId,
+    val workflowId: WorkflowId,
+    val workflowVersionId: WorkflowVersionId,
+    val executionId: ExecutionId,
     val producerId: ProducerId,
     val contextId: ContextId,
     val dependencyRevisions: Map<RegisterId, AssignmentId>,
@@ -109,38 +110,89 @@ interface CurrentViewProjection {
     fun allCurrent(): Map<RegisterKey, AssignmentMutation>
 }
 
+interface ActivationClaimer {
+    fun claimNextActivation(executionId: ExecutionId): ActivationIntent?
+    fun completeActivation(intentId: ActivationIntentId)
+}
+
 /**
  * An ordered in-memory journal. The lock covers batch validation, revision
  * allocation, journal append, current-view projection, and intent persistence.
  */
 class InMemoryJournalStore(
     private val clock: Clock = SystemClock,
-    private val idSource: IdSource = DeterministicIdSource("journal-"),
-) : JournalBatchCommitter, CurrentViewProjection {
+    private val idSource: IdSource = UuidIdSource(),
+) : JournalBatchCommitter, CurrentViewProjection, ActivationClaimer {
     private val lock = Any()
     private val journalBatches = mutableListOf<JournalBatch>()
     private val currentAssignments = linkedMapOf<RegisterKey, AssignmentMutation>()
     private val activationIntents = linkedMapOf<ActivationIntentId, ActivationIntent>()
     private val completedIntentIds = linkedSetOf<ActivationIntentId>()
     private val activationRecords = mutableListOf<ActivationRecord>()
+    private val assignmentsById = linkedMapOf<AssignmentId, AssignmentMutation>()
+    private val executionBindings = linkedMapOf<ExecutionId, ExecutionBinding>()
+
+    private data class ExecutionBinding(
+        val workflowVersionId: WorkflowVersionId,
+        val contentHash: String,
+        val parameters: Map<String, Value>,
+    )
+
+    fun bindExecution(
+        executionId: ExecutionId,
+        workflowVersionId: WorkflowVersionId,
+        contentHash: String,
+        parameters: Map<String, Value>,
+    ): Map<String, Value> = synchronized(lock) {
+        val proposed = ExecutionBinding(workflowVersionId, contentHash, parameters.toMap())
+        val existing = executionBindings[executionId]
+        require(existing == null || existing == proposed) {
+            "execution id is already bound to different workflow content or parameters"
+        }
+        executionBindings.putIfAbsent(executionId, proposed)
+        executionBindings.getValue(executionId).parameters
+    }
 
     override fun commit(batch: JournalBatch, activationIntents: Collection<ActivationIntent>): JournalBatch =
         synchronized(lock) {
             require(batch.mutations.size == 1) { "v1 journal batch must contain exactly one assignment mutation" }
+            require(batch.formatVersion == 1) { "unsupported journal batch format version ${batch.formatVersion}" }
             val mutation = batch.assignment
+            require(mutation.formatVersion == 1) { "unsupported assignment format version ${mutation.formatVersion}" }
+            require(mutation.mutationOrdinal == 0) { "the only v1 mutation must have ordinal zero" }
+
+            val duplicateBatch = journalBatches.firstOrNull { it.journalBatchId == batch.journalBatchId }
+            if (duplicateBatch != null) {
+                val requestedMutation = mutation
+                val committedMutation = duplicateBatch.assignment
+                require(
+                    duplicateBatch.formatVersion == batch.formatVersion &&
+                        duplicateBatch.committedAt == batch.committedAt &&
+                        committedMutation.copy(revision = requestedMutation.revision) == requestedMutation,
+                ) { "journal batch id is already committed with different contents" }
+                if (activationIntents.isNotEmpty()) {
+                    val persisted = this.activationIntents.values.filter { it.journalBatchId == batch.journalBatchId }
+                    require(persisted.size == activationIntents.size && activationIntents.all { proposed ->
+                        persisted.any { it.id == proposed.id && it.sameIdentityAndProvenance(proposed) }
+                    }) { "journal batch id is already committed with different activation intents" }
+                }
+                return@synchronized duplicateBatch
+            }
+
+            val duplicateAssignment = assignmentsById[mutation.assignmentId]
+            require(duplicateAssignment == null) { "assignment id is already committed" }
             val key = RegisterKey(mutation.executionId, mutation.contextId, mutation.registerId)
             val nextRevision = (currentAssignments[key]?.revision ?: 0L) + 1L
             val committedMutation = mutation.copy(revision = nextRevision)
             val committedBatch = batch.copy(mutations = listOf(committedMutation))
-
-            val duplicateBatch = journalBatches.firstOrNull { it.journalBatchId == committedBatch.journalBatchId }
-            if (duplicateBatch != null) {
-                require(duplicateBatch == committedBatch) { "journal batch id is already committed with different contents" }
-                return@synchronized duplicateBatch
-            }
             activationIntents.forEach { intent ->
+                require(intent.workflowId == mutation.workflowId)
+                require(intent.workflowVersionId == mutation.workflowVersionId)
+                require(intent.executionId == mutation.executionId)
+                require(intent.contextId == mutation.contextId)
+                require(intent.journalBatchId == batch.journalBatchId)
                 val duplicate = this.activationIntents[intent.id]
-                require(duplicate == null || duplicate == intent) {
+                require(duplicate == null || duplicate.sameIdentityAndProvenance(intent)) {
                     "activation intent id is already persisted with different contents"
                 }
             }
@@ -148,6 +200,7 @@ class InMemoryJournalStore(
             // These operations are intentionally one critical section: no observer
             // can see an assignment without its downstream durable intents.
             journalBatches += committedBatch
+            assignmentsById[committedMutation.assignmentId] = committedMutation
             currentAssignments[key] = committedMutation
             activationIntents.forEach { intent -> this.activationIntents.putIfAbsent(intent.id, intent) }
             committedBatch
@@ -188,7 +241,7 @@ class InMemoryJournalStore(
     fun persistActivationIntents(intents: Collection<ActivationIntent>) = synchronized(lock) {
         intents.forEach { intent ->
             val duplicate = activationIntents[intent.id]
-            require(duplicate == null || duplicate == intent) {
+            require(duplicate == null || duplicate.sameIdentityAndProvenance(intent)) {
                 "activation intent id is already persisted with different contents"
             }
             activationIntents.putIfAbsent(intent.id, intent)
@@ -209,18 +262,28 @@ class InMemoryJournalStore(
     fun assignments(): List<AssignmentMutation> = synchronized(lock) { journalBatches.map { it.assignment } }
     fun activationIntents(): List<ActivationIntent> = synchronized(lock) { activationIntents.values.toList() }
     fun activations(): List<ActivationRecord> = synchronized(lock) { activationRecords.toList() }
+    fun assignment(id: AssignmentId): AssignmentMutation? = synchronized(lock) { assignmentsById[id] }
 
     /** Claiming does not delete or acknowledge an intent; only completion does. */
-    fun claimNextActivation(): ActivationIntent? = synchronized(lock) {
-        activationIntents.values.firstOrNull { it.id !in completedIntentIds }
+    override fun claimNextActivation(executionId: ExecutionId): ActivationIntent? = synchronized(lock) {
+        activationIntents.values.firstOrNull { it.executionId == executionId && it.id !in completedIntentIds }
     }
 
-    fun completeActivation(intentId: ActivationIntentId) = synchronized(lock) {
+    override fun completeActivation(intentId: ActivationIntentId) = synchronized(lock) {
         require(intentId in activationIntents) { "cannot complete an unknown activation intent" }
         completedIntentIds += intentId
     }
 
     fun recordActivation(record: ActivationRecord) = synchronized(lock) {
+        val intent = activationIntents[record.intentId]
+            ?: error("cannot record activation for an unknown intent")
+        require(record.activationId == intent.activationId)
+        require(record.workflowId == intent.workflowId)
+        require(record.workflowVersionId == intent.workflowVersionId)
+        require(record.executionId == intent.executionId)
+        require(record.contextId == intent.contextId)
+        require(record.producerId == intent.producerId)
+        require(record.dependencyRevisions == intent.dependencyRevisions)
         activationRecords += record
     }
 
@@ -234,16 +297,24 @@ class InMemoryJournalStore(
         } }
 }
 
+private fun ActivationIntent.sameIdentityAndProvenance(other: ActivationIntent): Boolean =
+    copy(createdAt = other.createdAt) == other
+
 object CurrentViews {
     fun rebuild(batches: Iterable<JournalBatch>): Map<RegisterKey, AssignmentMutation> {
         val result = linkedMapOf<RegisterKey, AssignmentMutation>()
+        val batchIds = mutableSetOf<JournalBatchId>()
+        val assignmentIds = mutableSetOf<AssignmentId>()
         batches.forEach { batch ->
             require(batch.mutations.size == 1) { "v1 journal batch must contain exactly one assignment mutation" }
+            require(batchIds.add(batch.journalBatchId)) { "journal batch ids must be unique" }
             val assignment = batch.assignment
+            require(assignmentIds.add(assignment.assignmentId)) { "assignment ids must be unique" }
             val key = RegisterKey(assignment.executionId, assignment.contextId, assignment.registerId)
             val previous = result[key]
-            require(previous == null || assignment.revision > previous.revision) {
-                "assignment revisions must increase for each register"
+            val expectedRevision = (previous?.revision ?: 0L) + 1L
+            require(assignment.revision == expectedRevision) {
+                "assignment revisions must be contiguous for each register"
             }
             result[key] = assignment
         }
@@ -280,7 +351,7 @@ class ExpressionActivationPlanner : ActivationPlanner {
         journalBatchId: JournalBatchId,
         createdAt: Instant,
     ): List<ActivationIntent> = workflow.registers
-        .filter { requiredContextDependencies(it.producer).isEmpty() }
+        .filter { it.dependencies.isEmpty() }
         .map { intentFor(workflow, executionId, contextId, it, emptyMap(), journalBatchId, createdAt) }
 
     override fun afterAssignment(
@@ -323,6 +394,9 @@ class ExpressionActivationPlanner : ActivationPlanner {
             id = ActivationIntentId("intent-$identity"),
             activationId = ActivationId("activation-$identity"),
             producerId = register.producerId,
+            workflowId = WorkflowId(workflow.workflowId),
+            workflowVersionId = workflow.workflowVersionId,
+            executionId = executionId,
             contextId = contextId,
             journalBatchId = journalBatchId,
             createdAt = createdAt,
@@ -413,7 +487,7 @@ private sealed interface Evaluated {
 class InMemoryWorkflowRunner(
     private val compiler: WorkflowCompiler = WorkflowCompiler(),
     private val clock: Clock = SystemClock,
-    private val idSource: IdSource = DeterministicIdSource("run-"),
+    private val idSource: IdSource = UuidIdSource(),
     val journal: InMemoryJournalStore = InMemoryJournalStore(clock, idSource),
     private val planner: ActivationPlanner = ExpressionActivationPlanner(),
 ) {
@@ -435,6 +509,12 @@ class InMemoryWorkflowRunner(
         beforeActivation: (ActivationIntent) -> Unit = {},
     ): WorkflowRunResult {
         validateParameters(workflow, parameters)
+        val boundParameters = journal.bindExecution(
+            executionId,
+            workflow.workflowVersionId,
+            workflow.contentHash,
+            parameters,
+        )
         val contextId = ContextId(ANONYMOUS_CONTEXT)
         journal.persistActivationIntents(
             planner.initial(workflow, executionId, contextId, JournalBatchId(STARTUP_BATCH), clock.now()),
@@ -442,7 +522,7 @@ class InMemoryWorkflowRunner(
 
         val failures = mutableListOf<String>()
         while (true) {
-            val intent = journal.claimNextActivation() ?: break
+            val intent = journal.claimNextActivation(executionId) ?: break
             val register = workflow.registers.firstOrNull { it.producerId == intent.producerId }
                 ?: throw WorkflowExecutionException("activation refers to unknown producer ${intent.producerId.value}")
             val started = clock.now()
@@ -450,8 +530,8 @@ class InMemoryWorkflowRunner(
             // the persisted intent remains available for a later worker.
             beforeActivation(intent)
             try {
-                val context = journal.currentFor(executionId, intent.contextId)
-                val evaluated = evaluate(register.producer, workflow, parameters, context)
+                val context = capturedContext(intent)
+                val evaluated = evaluate(register.producer, workflow, boundParameters, context)
                 val value = materialize(evaluated)
                 if (evaluated !is Evaluated.OptionalResult) {
                     val validation = register.schema.validate(value)
@@ -470,6 +550,7 @@ class InMemoryWorkflowRunner(
                     producerId = register.producerId,
                     activationId = intent.activationId,
                     dependencyRevisions = intent.dependencyRevisions,
+                    causationId = intent.id.value,
                     occurredAt = clock.now(),
                     mutationOrdinal = 0,
                 )
@@ -492,6 +573,9 @@ class InMemoryWorkflowRunner(
                     ActivationRecord(
                         activationId = intent.activationId,
                         intentId = intent.id,
+                        workflowId = intent.workflowId,
+                        workflowVersionId = intent.workflowVersionId,
+                        executionId = intent.executionId,
                         producerId = intent.producerId,
                         contextId = intent.contextId,
                         dependencyRevisions = intent.dependencyRevisions,
@@ -506,6 +590,9 @@ class InMemoryWorkflowRunner(
                     ActivationRecord(
                         activationId = intent.activationId,
                         intentId = intent.id,
+                        workflowId = intent.workflowId,
+                        workflowVersionId = intent.workflowVersionId,
+                        executionId = intent.executionId,
                         producerId = intent.producerId,
                         contextId = intent.contextId,
                         dependencyRevisions = intent.dependencyRevisions,
@@ -520,16 +607,20 @@ class InMemoryWorkflowRunner(
             }
         }
 
-        val outputs = workflow.outputs.associateWith { outputName ->
+        val outputs = workflow.outputs.mapNotNull { outputName ->
             val register = workflow.registers.first { it.name == outputName }
             val assignment = journal.current(RegisterKey(executionId, contextId, register.registerId))
-                ?: throw WorkflowExecutionException("output '$outputName' received no assignment")
-            PublishedOutput(assignment.value, assignment.revision)
-        }
+            if (assignment == null && failures.isEmpty()) {
+                throw WorkflowExecutionException("output '$outputName' received no assignment")
+            }
+            assignment?.let { outputName to PublishedOutput(it.value, it.revision) }
+        }.toMap()
         return WorkflowRunResult(executionId, outputs, journal, failures)
     }
 
     private fun validateParameters(workflow: WorkflowIrDocument, parameters: Map<String, Value>) {
+        val unknown = parameters.keys - workflow.parameters.keys
+        if (unknown.isNotEmpty()) throw WorkflowExecutionException("unknown parameters: ${unknown.sorted().joinToString()}")
         workflow.parameters.forEach { (name, schema) ->
             parameters[name]?.let { value ->
                 val result = schema.validate(value)
@@ -539,6 +630,17 @@ class InMemoryWorkflowRunner(
             }
         }
     }
+
+    private fun capturedContext(intent: ActivationIntent): Map<RegisterId, AssignmentMutation> =
+        intent.dependencyRevisions.mapNotNull { (registerId, assignmentId) ->
+            if (assignmentId.value == ExpressionActivationPlanner.ABSENT_REVISION) return@mapNotNull null
+            val assignment = journal.assignment(assignmentId)
+                ?: throw WorkflowExecutionException("captured assignment '${assignmentId.value}' is missing")
+            require(assignment.executionId == intent.executionId && assignment.contextId == intent.contextId && assignment.registerId == registerId) {
+                "captured assignment does not match activation provenance"
+            }
+            registerId to assignment
+        }.toMap()
 
     private fun evaluate(
         expression: Expression,
@@ -624,16 +726,20 @@ typealias WorkflowRunner = InMemoryWorkflowRunner
 private object WorkflowInspection {
     fun toJson(result: WorkflowRunResult): String {
         val journal = result.journal
-        val batches = journal.batches().map { batch -> JsonObject(linkedMapOf(
+        val batches = journal.batches().filter { it.assignment.executionId == result.executionId }.map { batch -> JsonObject(linkedMapOf(
             "journalBatchId" to JsonPrimitive(batch.journalBatchId.value),
+            "formatVersion" to JsonPrimitive(batch.formatVersion),
             "committedAt" to JsonPrimitive(batch.committedAt.toString()),
             "mutations" to JsonArray(batch.mutations.map(::assignmentJson)),
         )) }
-        val intents = journal.activationIntents().map { intent ->
+        val intents = journal.activationIntents().filter { it.executionId == result.executionId }.map { intent ->
             val state = if (journal.isCompleted(intent.id)) "completed" else "pending"
             JsonObject(linkedMapOf(
                 "id" to JsonPrimitive(intent.id.value),
                 "activationId" to JsonPrimitive(intent.activationId.value),
+                "workflowId" to JsonPrimitive(intent.workflowId.value),
+                "workflowVersionId" to JsonPrimitive(intent.workflowVersionId.value),
+                "executionId" to JsonPrimitive(intent.executionId.value),
                 "producerId" to JsonPrimitive(intent.producerId.value),
                 "contextId" to JsonPrimitive(intent.contextId.value),
                 "journalBatchId" to JsonPrimitive(intent.journalBatchId.value),
@@ -642,10 +748,13 @@ private object WorkflowInspection {
                 "state" to JsonPrimitive(state),
             ))
         }
-        val activations = journal.activations().map { activation ->
+        val activations = journal.activations().filter { it.executionId == result.executionId }.map { activation ->
             val fields = linkedMapOf<String, JsonElement>(
                 "activationId" to JsonPrimitive(activation.activationId.value),
                 "intentId" to JsonPrimitive(activation.intentId.value),
+                "workflowId" to JsonPrimitive(activation.workflowId.value),
+                "workflowVersionId" to JsonPrimitive(activation.workflowVersionId.value),
+                "executionId" to JsonPrimitive(activation.executionId.value),
                 "producerId" to JsonPrimitive(activation.producerId.value),
                 "contextId" to JsonPrimitive(activation.contextId.value),
                 "dependencyRevisions" to revisionVector(activation.dependencyRevisions),
@@ -661,7 +770,7 @@ private object WorkflowInspection {
             "executionId" to JsonPrimitive(result.executionId.value),
             "outputs" to outputObject["outputs"]!!,
             "batches" to JsonArray(batches),
-            "assignments" to JsonArray(journal.assignments().map(::assignmentJson)),
+            "assignments" to JsonArray(journal.assignments().filter { it.executionId == result.executionId }.map(::assignmentJson)),
             "activationIntents" to JsonArray(intents),
             "activations" to JsonArray(activations),
         )).toString()
@@ -681,8 +790,11 @@ private object WorkflowInspection {
             "dependencyRevisions" to revisionVector(assignment.dependencyRevisions),
             "occurredAt" to JsonPrimitive(assignment.occurredAt.toString()),
             "mutationOrdinal" to JsonPrimitive(assignment.mutationOrdinal),
+            "formatVersion" to JsonPrimitive(assignment.formatVersion),
         )
         assignment.activationId?.let { fields["activationId"] = JsonPrimitive(it.value) }
+        assignment.invocationId?.let { fields["invocationId"] = JsonPrimitive(it.value) }
+        assignment.emissionId?.let { fields["emissionId"] = JsonPrimitive(it.value) }
         assignment.causationId?.let { fields["causationId"] = JsonPrimitive(it) }
         return JsonObject(fields)
     }

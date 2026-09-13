@@ -47,7 +47,9 @@ data class JournalBatch(
 }
 data class ActivationIntent(
     val id: ActivationIntentId, val activationId: ActivationId, val producerId: ProducerId,
-    val contextId: ContextId, val journalBatchId: JournalBatchId, val createdAt: Instant,
+    val workflowId: WorkflowId, val workflowVersionId: WorkflowVersionId,
+    val executionId: ExecutionId, val contextId: ContextId,
+    val journalBatchId: JournalBatchId, val createdAt: Instant,
     /** The immutable register-revision snapshot captured by this activation. */
     val dependencyRevisions: Map<RegisterId, AssignmentId> = emptyMap(),
 ) {
