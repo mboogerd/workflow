@@ -14,22 +14,36 @@ class DeterministicIdSource(private val prefix: String = "id-") : IdSource {
 class UuidIdSource : IdSource { override fun nextId(): String = UUID.randomUUID().toString() }
 
 data class AssignmentMutation(
-    val assignmentId: AssignmentId, val contextId: ContextId, val registerId: RegisterId,
-    val value: Value, val producerId: ProducerId, val activationId: ActivationId? = null,
-    val causationId: String? = null, val revision: Long = 1, val occurredAt: Instant,
-    val formatVersion: Int = 1, val mutationOrdinal: Int = 0
+    val assignmentId: AssignmentId,
+    val workflowId: WorkflowId,
+    val workflowVersionId: WorkflowVersionId,
+    val executionId: ExecutionId,
+    val contextId: ContextId,
+    val registerId: RegisterId,
+    val value: Value,
+    val producerId: ProducerId,
+    val activationId: ActivationId? = null,
+    val dependencyRevisions: Map<RegisterId, AssignmentId> = emptyMap(),
+    val invocationId: InvocationId? = null,
+    val emissionId: EmissionId? = null,
+    val causationId: String? = null,
+    val revision: Long = 1,
+    val occurredAt: Instant,
+    val formatVersion: Int = 1,
+    val mutationOrdinal: Int = 0,
 )
 data class JournalBatch(
-    val journalBatchId: JournalBatchId, val formatVersion: Int = 1,
-    val mutationOrdinal: Int = 0, val assignment: AssignmentMutation,
-    val committedAt: Instant
+    val journalBatchId: JournalBatchId,
+    val mutations: List<AssignmentMutation>,
+    val committedAt: Instant,
+    val formatVersion: Int = 1,
 ) {
-    companion object {
-        fun create(id: JournalBatchId, mutations: List<AssignmentMutation>, committedAt: Instant, formatVersion: Int = 1): JournalBatch {
-            require(mutations.size == 1) { "v1 journal batch must contain exactly one assignment mutation" }
-            return JournalBatch(id, formatVersion, 0, mutations.single(), committedAt)
-        }
+    init {
+        require(mutations.size == 1) { "v1 journal batch must contain exactly one assignment mutation" }
+        require(mutations.single().mutationOrdinal == 0) { "the only v1 mutation must have ordinal zero" }
     }
+
+    val assignment: AssignmentMutation get() = mutations.single()
 }
 data class ActivationIntent(
     val id: ActivationIntentId, val activationId: ActivationId, val producerId: ProducerId,
