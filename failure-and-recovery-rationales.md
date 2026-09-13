@@ -5,7 +5,7 @@ This is a chronological, append-only decision log. It explains the design in
 
 ## 2026-09-13 — RECOVERY-001: Make failure a terminal value
 
-**Status:** Active
+**Status:** Superseded by RECOVERY-006
 
 A failed provider that emits no value would leave dependents waiting forever and
 make absence timing-dependent. A typed terminal outcome lets ordinary graph
@@ -49,3 +49,15 @@ Many real effects are only partially compensable, time-sensitive, or require
 new authorization. A declared compensation provider can express those realities;
 an automatic “undo” abstraction cannot.
 
+## 2026-09-13 — RECOVERY-006: Separate activation failure from register assignment
+
+**Status:** Active
+
+A streaming or repeatedly activated provider may fail after having emitted valid
+values. Replacing its current register value with every operational failure would
+mix provider lifecycle with application data and discard a useful last value.
+
+Failures are therefore durable activation records. The current register remains
+unchanged unless the provider deliberately emits a typed error value. Recovery
+can retry, reconcile, compensate, or emit a replacement, and any resulting
+emission follows the normal assignment and downstream-reactivation rules.

@@ -2,64 +2,74 @@
 
 ## Objective
 
-Provide the smallest declarative language that makes workflow dataflow,
-integration, and lifecycle visible while delegating implementation details to
-reusable providers and execution engines.
+Provide the smallest declarative language that makes reactive workflow dataflow
+and reusable integrations visible while delegating implementation details to
+providers and an execution backend.
 
-The primary use case is a deterministic workflow containing potentially
-nondeterministic agentic steps and constrained agentic recovery.
+The primary use case is predictable orchestration containing potentially
+nondeterministic agentic providers and constrained agentic recovery.
 
 ## Initial version
 
 The initial version includes:
 
-- staged Python authoring and a portable, serializable IR;
-- event sources and explicit workflow-instance correlation;
-- named single-assignment facts and dependency-derived scheduling;
-- immediate parallel execution of ready nodes;
-- a small binding and predicate algebra, without arbitrary expressions;
-- typed provider calls, including external and agentic providers;
-- explicit terminal outcomes, attempts, retry, timeout, and cancellation;
-- finite conditional branches;
+- YAML authoring that maps closely to a portable, serializable IR;
+- named, versioned context registers backed by append-only assignment logs;
+- latest-assignment references and dependency-derived activation;
+- immediate parallel execution of independent activated nodes;
+- expressions as the default context definition;
+- one uniform provider construct for event sources, integrations, pure
+  functions, and agentic work;
+- anonymous workflow startup and optional correlation routing on emissions;
+- repeated assignment and downstream reactivation;
+- a small YAML expression and predicate algebra, without arbitrary code;
+- provider attempts, failure, retry, timeout, cancellation, and reconciliation;
+- reactive conditional branches;
 - finite scatter/gather through `map`;
-- durable execution records sufficient for deterministic replay;
-- stable effect identity and reconciliation of ambiguous effects.
+- durable records sufficient for deterministic replay of observed execution;
+- a purpose-built, backend-independent first runtime.
 
 ## Explicit non-goals for the initial version
 
 - A general-purpose programming language.
-- Arbitrary Python execution inside the portable workflow graph.
-- Implicit dependency discovery from arbitrary context reads.
-- Mutable shared state.
-- Unbounded `while` loops, recursive workflows, or general cyclic graphs.
-- Full streaming query semantics over never-ending collections.
+- Separate `source`, `call`, or `let` syntax.
+- Arbitrary host-language execution inside the portable workflow graph.
+- Implicit dependency discovery from provider implementation behavior.
+- In-place mutation without an assignment revision.
+- Once-only execution per correlation id.
+- Declared provider cardinality, automatic deduplication, debouncing, or
+  coalescing.
+- A natural terminal state for continuously emitting workflows.
+- Unbounded loops, recursive workflows, or general cyclic graphs.
 - Exactly-once external effects without cooperation from the external system.
 - Exposing an agent framework's internal graph as workflow nodes by default.
-- Transparent migration of in-flight instances between incompatible workflow
-  versions.
-- Distributed scheduling as a language-level concern.
+- Distributed scheduling.
+- A dependency on ComputeNet for the first runtime.
 
 ## Deferred extensions
 
+- Per-node policies such as once, distinct-until-changed, debounce, coalesce,
+  latest-only, or explicit cardinality.
+- Context sealing, completion, retention, and event-window policies.
 - Bounded iteration or fixpoint as a first-class graph construct.
 - A richer portable expression language, if real workflows demonstrate the
   need.
-- Auto-packaged local transform providers for small pieces of arbitrary code.
-- Recursive or streaming monotone collections with explicit frontiers.
+- Lightweight packaging of local transform providers.
+- Recursive or streaming collections with explicit frontiers.
 - Subworkflows, reusable graph fragments, and higher-order workflow templates.
-- Workflow-version migration protocols.
+- Generated typed authoring frontends.
+- A ComputeNet execution backend.
 
 ## Current open decisions
 
-1. Whether singular references use RFC 9535 JSONPath syntax, generated typed
-   accessors, or both as frontends to one path IR.
-2. The exact schema system and compatibility rules at provider boundaries.
-3. Whether the first implementation supports declared growing collections or
-   only finite `map` inputs.
+1. The exact schema system and compatibility rules at provider boundaries.
+2. Scheduling semantics when a dependency changes while its consumer is still
+   running, including stale result handling.
+3. Whether provider emissions are globally ordered per context or only ordered
+   per named register.
 4. The provider packaging, discovery, and deployment protocol.
-5. Which execution records are retained indefinitely versus compacted.
-6. The exact boundary between ComputeNet-native provider cells and remote
-   provider workers.
-7. Whether bounded iteration belongs in the first usable release or the first
-   extension.
+5. How effectful downstream providers expose and control repeated activation.
+6. The exact reactive semantics of `match` and `map` under repeated updates.
+7. Which execution records are retained indefinitely versus compacted.
+8. When a workflow execution or keyed context may be closed and collected.
 

@@ -1,10 +1,8 @@
 # Workflow language design
 
-This directory describes a small declarative workflow language intended to run
-on ComputeNet. The present direction is a staged Python DSL that compiles to a
-portable workflow IR. The workflow is a dataflow graph of single-assignment
-facts; providers perform pure computation, external integration, or bounded
-agentic work.
+This directory describes a small, backend-independent workflow language. The
+present direction is YAML with a deliberately limited expression vocabulary
+that lowers almost directly to a portable workflow IR.
 
 This is a design, not yet an implementation contract.
 
@@ -27,64 +25,77 @@ rewrite its historical content.
 
 ## Design in one page
 
-A workflow definition declares named facts. A fact is produced by a source, a
-small built-in value construction, a provider call, a conditional branch, or a
-finite mapping operation. References between definitions form the dependency
-graph, so sequence, parallelism, and joins need no separate syntax.
+A workflow declares named context values. Each name is a versioned register
+whose assignments form an append-only log. An ordinary reference reads its
+latest assignment.
 
-The context is a logical view of facts known for one workflow instance, not a
-mutable dictionary passed between tasks. Ordinary facts are assigned once.
-Collections may grow only through an explicitly declared monotone collection
-or finite map construct with a closure rule.
+A context value is produced by a limited expression, a provider, `match`, or
+`map`. References in a definition form its dependencies. An assignment to any
+name activates downstream definitions that reference it, even when the newly
+assigned value equals the previous value. Declaration order has no semantic
+effect.
 
-The orchestration layer is deterministic. Provider calls—especially agentic
-ones—may be nondeterministic, but their attempts and terminal outcomes are
-recorded. Replay consumes those records instead of repeating effects or model
-calls.
+There are no separate `source`, `call`, or `let` constructs. Every producer
+without context dependencies activates once in the anonymous context when the
+workflow starts. A producer with dependencies is activated by assignments to
+those dependencies. A provider may emit zero, one, or many values.
 
-The first version has no general-purpose expression language. It has a small,
-portable binding algebra for literals, singular references, object/list
-construction, string concatenation, simple predicates, and outcome matching.
-Complex transformation remains possible through explicit providers.
+Each provider emission optionally carries a correlation id. An explicit id
+routes the assignment to that keyed workflow instance and context, creating it
+when necessary. An
+omitted id inherits the invocation's context. Repeated emissions with the same
+correlation id append new assignments and reactivate downstream work; the first
+milestone does not impose once-only or cardinality rules.
 
-Python is the initial authoring surface, not the execution semantics. Running a
-definition builds and validates a language-neutral IR. A Kotlin/ComputeNet
-runtime can execute that IR without evaluating Python.
+The first version has no general-purpose expression language. YAML expression
+positions admit a small, portable algebra for literals, singular references,
+object/list construction, string concatenation, simple predicates, and outcome
+matching. Complex transformation remains possible through providers.
+
+Provider behavior—especially agentic behavior—may be nondeterministic, but
+assignments, activations, attempts, and outcomes are recorded. Replay consumes
+those records instead of repeating effects or model calls.
+
+YAML is the initial authoring and interchange surface. Its structure stays close
+to the language-neutral IR. The first runtime will be purpose-built for these
+semantics rather than implemented on ComputeNet; ComputeNet remains a possible
+future backend.
 
 ## Topic map
 
 | Current design | Decision history | Subject |
 | --- | --- | --- |
 | [Scope](scope.md) | [Rationales](scope-rationales.md) | Initial boundary, non-goals, unresolved decisions |
-| [Core model](core-model.md) | [Rationales](core-model-rationales.md) | Facts, dependencies, and graph constructs |
-| [Values and bindings](values-and-bindings.md) | [Rationales](values-and-bindings-rationales.md) | Data model and deliberately small glue language |
-| [Execution semantics](execution-semantics.md) | [Rationales](execution-semantics-rationales.md) | Readiness, parallelism, branching, mapping, replay |
-| [Providers and effects](providers-and-effects.md) | [Rationales](providers-and-effects-rationales.md) | Integration contracts and side-effect safety |
+| [Core model](core-model.md) | [Rationales](core-model-rationales.md) | Versioned registers, producers, and dependencies |
+| [Values and bindings](values-and-bindings.md) | [Rationales](values-and-bindings-rationales.md) | Data model and deliberately small expression language |
+| [Execution semantics](execution-semantics.md) | [Rationales](execution-semantics-rationales.md) | Assignments, activation, reactivity, and replay |
+| [Providers and effects](providers-and-effects.md) | [Rationales](providers-and-effects-rationales.md) | Provider emissions and side-effect safety |
 | [Agentic steps](agentic-steps.md) | [Rationales](agentic-steps-rationales.md) | Bounded nondeterminism and agent-framework integration |
-| [Failure and recovery](failure-and-recovery.md) | [Rationales](failure-and-recovery-rationales.md) | Outcomes, retry, reconciliation, and agentic recovery |
-| [Instances and events](instances-and-events.md) | [Rationales](instances-and-events-rationales.md) | Correlation, multi-event input, closure, lifecycle |
-| [Authoring and IR](authoring-and-ir.md) | [Rationales](authoring-and-ir-rationales.md) | Python DSL, compiler, validation, portable artifact |
-| [ComputeNet execution](computenet-execution.md) | [Rationales](computenet-execution-rationales.md) | Mapping the language onto ComputeNet without coupling it |
+| [Failure and recovery](failure-and-recovery.md) | [Rationales](failure-and-recovery-rationales.md) | Attempts, failures, retry, reconciliation, and recovery |
+| [Instances and events](instances-and-events.md) | [Rationales](instances-and-events-rationales.md) | Anonymous startup, correlation routing, keyed contexts |
+| [Authoring and IR](authoring-and-ir.md) | [Rationales](authoring-and-ir-rationales.md) | YAML syntax, compiler, validation, portable artifact |
+| [Execution backend](execution-backend.md) | [Rationales](execution-backend-rationales.md) | Purpose-built first runtime and backend boundary |
 
 ## Suggested reading paths
 
 - Language semantics: core model → values and bindings → execution semantics.
 - Integrations: providers and effects → failure and recovery.
 - Agentic workflows: agentic steps → failure and recovery → execution semantics.
-- Implementation: authoring and IR → ComputeNet execution → instances and events.
+- Implementation: authoring and IR → execution backend → instances and events.
 
 ## Cross-cutting invariants
 
 1. Dependencies are explicit in the compiled IR and derivable without running a
    provider.
-2. A fact has one terminal assignment; retries create attempts, not new fact
-   values.
-3. Missing, `null`, failure, and an open input scope are distinct states.
-4. Negative conclusions require a terminal outcome or a sealed input scope.
-5. Effects use stable invocation identity and can be reconciled after ambiguous
+2. Every accepted assignment appends a revision; “current value” means the
+   latest revision for one context and name.
+3. Every assignment is an event, even when its payload equals the previous one.
+4. Every activation records the dependency revisions from which it was derived.
+5. Correlation routes an emission; it does not silently copy another context.
+6. Missing, `null`, provider failure, and no assignment yet remain distinct.
+7. Effects use stable invocation identity and can be reconciled after ambiguous
    failure.
-6. Agentic recovery proposes a typed action; the deterministic runtime decides
-   whether it is authorized.
-7. The IR, not Python source or a particular engine, is the durable workflow
-   definition.
-
+8. Agentic recovery proposes a typed action; the runtime decides whether it is
+   authorized.
+9. The canonical IR, not YAML presentation details or a particular backend, is
+   the durable workflow definition.

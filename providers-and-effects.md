@@ -1,71 +1,96 @@
 # Providers and effects
 
-## Provider contract
+## Uniform provider contract
 
-A provider is addressed by stable provider id and version. Its descriptor
-declares:
+A provider is a producer implementation addressed by stable provider id and
+version. Event listeners, one-shot lookups, transformations, external mutations,
+and agentic work all use this construct.
 
-- input and output schemas;
-- configuration schema;
+Its descriptor declares:
+
+- input, emitted-value, configuration, and error schemas;
 - effect class;
 - required capabilities and secrets;
-- timeout and cancellation behavior;
+- completion, failure, timeout, and cancellation behavior;
 - idempotency and reconciliation support;
 - compatibility metadata;
 - an implementation endpoint or engine-native binding.
 
-A `call` contains only provider identity, validated configuration, bound input,
-and execution policy. Workflow definitions do not contain integration code.
+A provider context definition contains provider identity, validated
+configuration, bound inputs, and execution policy. It contains no integration
+implementation code.
+
+## Activation and emission
+
+A provider without context dependencies is activated once in the anonymous
+context when the workflow starts. A provider with dependencies receives a new
+activation when its captured dependency-revision vector changes through an
+assignment.
+
+An activation may emit zero, one, or many values and may then complete, fail, or
+remain open. The language does not declare provider cardinality in the first
+milestone. The runtime protocol nevertheless communicates emissions and
+activation lifecycle events.
+
+Each emission contains:
+
+- a value conforming to the provider's emission schema;
+- an optional correlation id;
+- stable provider emission identity;
+- invocation and attempt provenance.
+
+The engine routes the emission and appends it to the register named by the
+provider definition.
 
 ## Effect classes
 
-The initial model distinguishes:
+The provider descriptor distinguishes:
 
-- **pure**: output depends only on input and pinned implementation version;
-- **read**: observes external state but does not intentionally mutate it;
+- **pure**: emissions depend only on bound input and pinned implementation;
+- **read**: observes external state without intentional mutation;
 - **effect**: may mutate an external system;
-- **agentic**: may be nondeterministic and may use declared tools, some of
-  which can be effects.
+- **agentic**: may be nondeterministic and use declared tools, including
+  effectful tools.
 
-Effect class informs caching, retry, replay, authorization, and audit behavior.
-It is part of the provider contract, not an engine guess.
+Effect class informs caching, retry, replay, authorization, and audit. It is not
+inferred from whether a provider has dependencies or emits repeatedly.
 
 ## Invocation identity
 
-Every call receives a stable logical invocation id derived from workflow
-instance, node identity, and map item identity. Each physical attempt also has
-an append-only attempt id.
+Every activation receives a stable logical invocation id derived from workflow
+execution, context, producer, and dependency-revision vector. Each physical
+attempt has an append-only attempt id, and each emission has an id unique within
+the invocation.
 
-An effect provider must use the logical invocation id as an idempotency key when
-the external system supports one. The engine never equates a transport timeout
-with proof that no effect occurred.
+An effect provider uses the logical invocation id as an idempotency key when the
+external system supports one. Repeated assignments intentionally create distinct
+activations and therefore distinct effect identities.
 
-## Outcomes
+## Failure and emitted error values
 
-Providers return a terminal `Outcome<Success, Error>` with a typed success value
-or typed failure information. Timeout and cancellation are explicit variants or
-standard typed failures, as fixed by the common outcome schema.
+Provider lifecycle failure is recorded against the activation and does not erase
+a previous register value. A provider may instead emit a typed application error
+as data when downstream `match` handling is part of its contract.
 
-Provider protocol errors—invalid output, schema mismatch, lost worker, or
-unsupported cancellation—are converted to engine-defined typed failures. They
-do not leave a fact unresolved forever.
+Protocol errors—invalid output, schema mismatch, lost worker, or unsupported
+cancellation—become engine-defined activation failures. They do not fabricate a
+register assignment.
 
 ## Reconciliation
 
 An effect provider declares one of:
 
-- effect is idempotent under logical invocation id;
-- provider can query/reconcile the outcome by invocation id;
-- effect is not safely retryable and ambiguous completion requires human or
-  policy intervention.
+- effects are idempotent under logical invocation id;
+- the provider can query/reconcile outcome by invocation id;
+- ambiguous completion is not safely retryable and requires policy or human
+  intervention.
 
-Compensation is a separate declared provider operation. It is not assumed to be
-an automatic inverse.
+Compensation is a separate provider operation, not an assumed inverse.
 
-## Provider portability
+## Portability
 
-Provider implementations may be written in any language. Calls cross the engine
-boundary through the canonical value model and provider protocol. Very small,
-portable transformations should remain `let` bindings; complex or
-language-specific transformations are providers even when deployed in-process.
+Provider implementations may use any language. Calls cross the runtime boundary
+through the canonical value and provider protocols. Small portable
+transformations remain expressions; complex or language-specific transformations
+are providers even when deployed in-process.
 

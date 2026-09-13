@@ -49,3 +49,15 @@ part of the minimum safe effect contract.
 This is also why “exactly once” is not promised solely by the workflow runtime.
 External idempotency or queryable operation identity is required.
 
+## 2026-09-13 — PROVIDER-005: Use one provider construct for sources and calls
+
+**Status:** Active
+
+Both former constructs bind an integration and wait for it to produce values.
+Whether it listens indefinitely, emits once, emits repeatedly, or completes is
+provider protocol behavior. Dependencies determine when a provider is activated;
+an optional correlation id on each emission determines where its value is
+assigned.
+
+The runtime still observes emission, completion, and failure messages, but the
+workflow language does not require a source/call category or declared cardinality.

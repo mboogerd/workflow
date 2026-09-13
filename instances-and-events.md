@@ -1,66 +1,63 @@
 # Instances and events
 
-## Identity
+## Execution and context identity
 
-A workflow instance has the logical identity:
+Starting a workflow creates a `workflow_execution_id` and one anonymous workflow
+instance. An instance and its context have the identity:
 
-`(workflow_id, workflow_version, correlation_key)`
+`(workflow_execution_id, correlation_id?)`
 
-It also has an engine-assigned `run_id`. Each accepted source event has a stable
-`event_id`. Provider invocations and attempts derive their identity from these
-values plus node and map-item identity.
+The anonymous context uses the absent correlation id. A correlated context is
+created lazily when the first emission targets its key.
 
-The correlation key is produced by a source-specific, portable binding. Events
-without a valid key are rejected or routed to an explicit dead-letter policy;
-they never create an accidental global instance.
+The workflow definition id, version, and content hash are immutable metadata of
+the execution.
 
-## Source declarations
+## Anonymous startup
 
-A source declares:
+All producer definitions without context dependencies activate once in the
+anonymous context. This uniform rule covers constant expressions, event
+subscriptions, timers, one-shot reads, generated seeds, and other roots without
+classifying them as sources or calls.
 
-- provider and event schema;
-- optional acceptance predicate;
-- correlation-key binding;
-- cardinality: `one` or `many`;
-- duplicate identity and handling;
-- ordering key when order matters;
-- opening and closure policy;
-- late-event policy.
+A correlated instance does not start another copy of the root producers. It
+receives work through routed assignments and their downstream dependencies.
 
-Multiple sources may contribute facts to the same instance. A `one` source
-assigns one fact. A `many` source contributes to a declared collection with
-stable item keys and merge semantics.
+## Emission routing
 
-## Opening and closure
+Every provider emission may carry a correlation id:
 
-The first accepted event normally opens an instance. Nodes with no unresolved
-dependencies may run immediately after opening; source-dependent nodes wait for
-their facts.
+- a new id creates a context and assigns the provider's named register there;
+- an existing id appends another assignment to that context and register;
+- no id inherits the provider activation's context;
+- no id from an anonymous root writes to the anonymous context.
 
-Any input whose absence or completeness matters must eventually be sealed. A
-source or collection closure policy may use an explicit close event, expected
-count, event-time window plus watermark, or administrative action. Wall-clock
-silence alone is not logical proof of absence unless the declared policy makes
-it so and records the decision.
+Routing a value to a new context does not copy values from the originating
+context. Providers must emit or derive every value that context needs.
 
-## Duplicate and late events
+## Repeated correlation
 
-Duplicate `event_id` values are idempotently ignored after the first accepted
-record. Conflicting payloads under one event id are protocol errors.
+Correlation identifies a destination; it does not provide once-only semantics.
+The same provider—or different activations of it—may emit the same correlation id
+multiple times. Every accepted emission appends a revision and triggers
+downstream dependencies again, including when the payload is equal to the
+current value.
 
-Late events follow a source policy: reject, append while the instance remains
-open, or open a new run/revision. A completed fact is never silently rewritten.
+The first milestone has no source cardinality declaration and performs no
+automatic deduplication, debounce, coalescing, or “already executed” check based
+on correlation id. These may become explicit policies if practical workflows
+need them.
+
+Providers may carry their own external event ids in emission metadata for audit
+or provider-level deduplication, but the workflow language does not assign those
+ids semantic behavior initially.
 
 ## Lifecycle
 
-An instance progresses monotonically through:
+A keyed context is active after its first assignment and may later be quiescent.
+An open provider can reactivate it at any time. Neither quiescence nor provider
+closure implicitly completes the context or workflow execution.
 
-`open → sealed → completed | failed | cancelled`
-
-`sealed` means no new source contributions are accepted under the current run's
-closure rules. It does not imply that all provider calls have finished.
-
-Completion requires every exported fact to be terminal and every required
-effect/recovery obligation to be resolved. Runtime retention and archival are
-separate from logical completion.
-
+Explicit close, seal, retention, and garbage-collection policies are deferred.
+Until such policies exist, the runtime retains enough history to reconstruct the
+current view and replay observed activations.

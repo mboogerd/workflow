@@ -2,80 +2,119 @@
 
 ## Initial authoring surface
 
-The initial authoring surface is an embedded Python DSL. Python code runs at
-compile time to construct a workflow definition. It is not shipped as the
-workflow's runtime semantics.
+The initial authoring surface is YAML 1.2 parsed as data with the core schema.
+The language permits no custom YAML tags or executable constructors. Parsers
+place bounded limits on aliases, nesting, and document size.
 
-The DSL exposes typed builders for workflow constructs, references, bindings,
-predicates, schemas, and provider descriptors. IDE type checking, completion,
-navigation, and syntax highlighting apply to ordinary Python authoring code.
+The document has one `workflow` object:
 
-Arbitrary Python values may help assemble a definition, but any value entering
-the graph must become a supported IR node. Python lambdas or functions are not
-serialized as hidden expressions.
+```yaml
+workflow:
+  id: issue-to-pr
+  version: 1
 
-## Definition-time discipline
+  parameters:
+    agent:
+      schema: string
 
-A definition must be reproducible from its declared source and dependencies.
-Definition code must not make workflow structure depend on current time,
-randomness, network responses, ambient secrets, or mutable local state.
+  context:
+    event:
+      provider: jira.issue.created
+      version: 1
+      config:
+        assignee: {$ref: "$.parameters.agent"}
 
-The compiler should run definition construction in a controlled process and
-record source dependencies. The generated canonical IR and its hash are the
-artifact used for deployment and execution.
+    repo:
+      $ref: "$.event.issue.component"
+
+    pr:
+      provider: agentic-developer
+      version: 1
+      with:
+        prompt: {$ref: "$.event.issue.description"}
+        repo: {$ref: "$.repo"}
+        agent-id:
+          $concat:
+            - agentic-builder-
+            - {$ref: "$.event.issue.id"}
+
+  outputs:
+    - pr
+```
+
+Each `context` entry defines one named versioned register. Its definition is:
+
+- an expression directly;
+- a mapping containing `provider`;
+- a mapping containing `match`; or
+- a mapping containing `map`.
+
+There are no `source`, `call`, or `let` wrappers. Entry order is not semantic.
+References in expressions, provider inputs, branches, and map bodies define
+dependencies.
+
+Plain YAML values and reserved `$` operators are specified in
+[Values and bindings](values-and-bindings.md). Unknown semantic fields and
+operators are compile errors rather than implicit extension points.
+
+YAML anchors and aliases may be accepted for presentation-level reuse. They are
+expanded before semantic validation and have no identity or runtime meaning.
 
 ## Compilation pipeline
 
-1. Import and execute the workflow-definition module in definition mode.
-2. Build the graph and binding ASTs.
+1. Parse one YAML document using the constrained YAML profile.
+2. Decode register producers and expression ASTs.
 3. Resolve provider descriptors and schemas.
 4. Infer dependencies from references.
-5. Validate the complete graph.
-6. Normalize and serialize canonical IR with source locations.
+5. Validate the complete producer graph.
+6. Normalize and serialize canonical IR with YAML source locations.
 7. Assign or verify workflow version and content hash.
-8. Deploy the IR and separately packaged providers to an execution engine.
+8. Deploy the IR and separately packaged providers to an execution backend.
 
 ## Static validation
 
 Compilation rejects:
 
-- duplicate or unstable node identities;
+- duplicate or unstable register identities;
+- multiple definitions for one context name;
 - cycles outside supported nested constructs;
-- references to unknown facts or non-singular paths;
+- references to unknown registers or non-singular paths;
 - missing required bindings and schema incompatibilities;
 - non-exhaustive or output-incompatible branches;
-- unbounded or unsealed map inputs;
 - unresolved provider versions;
 - undeclared capabilities or effects;
 - unsafe retry/reconciliation combinations;
-- absence checks over open inputs;
-- outputs that can remain unresolved under a reachable branch.
+- provider configuration containing context references where the provider
+  requires deployment-static configuration;
+- outputs that cannot ever receive an assignment under any reachable state.
+
+The compiler does not reject repeated provider emissions, repeated correlation
+ids, or repeated assignments of equal payloads. Those are normal runtime events.
 
 ## Portable IR
 
 The IR contains at least:
 
-- workflow identity, semantic version, content hash, and policy versions;
-- stable node ids and source locations;
-- node kinds, dependencies, and nested graph structure;
-- binding and predicate ASTs;
-- input, output, and error schemas;
+- workflow identity, version, content hash, and policy versions;
+- stable register/producer ids and source locations;
+- producer kinds, dependencies, and nested graph structure;
+- expression and predicate ASTs;
+- input, emission, and error schemas;
 - provider ids, versions, configurations, effects, and capabilities;
-- source correlation/cardinality/closure policies;
+- assignment, correlation, activation, and provenance semantics;
 - retry, timeout, cancellation, recovery, and map policies;
-- exported outputs.
+- exported register names.
 
-The IR is language-neutral and versioned independently from the Python package.
-An engine either supports its IR version or rejects it before execution.
+The IR is language-neutral and versioned independently from the YAML surface
+schema. A backend either supports its IR version or rejects it before execution.
 
 ## Other authoring forms
 
-YAML may later provide a direct authoring or interchange syntax for the same IR.
-It must not introduce semantics unavailable to the Python DSL. Conversely,
-Python convenience APIs must lower to IR rather than becoming Python-only
-runtime behavior.
+Generated typed builders or embedded DSLs may later target the same IR. They
+must not introduce semantics unavailable to YAML and must emit an inspectable
+artifact independent of the host language.
 
-Complex glue uses an explicit provider. A future convenience feature may
-package a Python transform as a provider automatically, but the resulting IR
-must still show a versioned provider boundary.
+Complex glue uses a provider. Future tooling may package a local transform as a
+provider automatically, but the resulting IR must still expose a versioned
+provider boundary.
 

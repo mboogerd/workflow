@@ -5,7 +5,7 @@ This is a chronological, append-only decision log. It explains the design in
 
 ## 2026-09-13 — CORE-001: Model context as monotone facts
 
-**Status:** Active
+**Status:** Refined by CORE-005
 
 The original sketch described a monotonically growing shared context. Making
 that context a logical projection of immutable facts is more precise than a
@@ -48,3 +48,25 @@ keyed execution. A general loop introduces feedback, mutable iteration state,
 termination, and replay questions. Bounded iteration can later be added as a
 separate construct rather than hidden inside `map`.
 
+## 2026-09-13 — CORE-005: Replace single-assignment facts with versioned registers
+
+**Status:** Active
+
+Repeated provider emissions are useful rather than exceptional: an event source
+can emit the same correlation id more than once, a read can refresh, and an
+agent can be reactivated by changed input. Treating the visible context value as
+the latest assignment makes this reactivity direct.
+
+The durable model remains monotone at the history level. Assignments append to a
+register log; “overwrite” changes only its materialized current-value view. This
+preserves replay and provenance without forcing values to be single-assignment.
+
+## 2026-09-13 — CORE-006: Unify source, call, and let behind producers
+
+**Status:** Active
+
+Event sources and calls both ask a provider to produce values; their difference
+is provider behavior, not graph syntax. A context expression is already
+unambiguously a derived value, making a `let` wrapper redundant. Removing all
+three constructs leaves expressions, providers, `match`, and `map` as the
+minimal producer forms.

@@ -5,7 +5,7 @@ This is a chronological, append-only decision log. It explains the design in
 
 ## 2026-09-13 — AGENT-001: Treat an agent as a provider, not as the outer language
 
-**Status:** Active
+**Status:** Refined by AGENT-005
 
 The workflow should remain easy to audit and reason about even when one step is
 open-ended. A provider boundary gives the agent typed input, bounded authority,
@@ -42,3 +42,15 @@ Aliases such as a provider's “latest” model can change while a workflow vers
 does not. Reproducibility and audit therefore require recording the actual model,
 prompt/strategy version, tool policy, and budgets used by each attempt.
 
+## 2026-09-13 — AGENT-005: Activate agents from dependency revisions
+
+**Status:** Active
+
+Under the reactive register model an agent is not inherently a once-per-workflow
+step. Every dependency assignment can create a new activation with a captured
+revision vector. The agent may emit one or more values, all recorded with that
+provenance.
+
+This makes repeated agent cost and effects visible consequences of reactive
+inputs. Policies such as latest-only or coalescing may later control them, but
+they are not implicit in the initial language.

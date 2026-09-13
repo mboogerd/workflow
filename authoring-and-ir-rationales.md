@@ -14,7 +14,7 @@ direct syntax or interchange form if it maps exactly to the IR.
 
 ## 2026-09-13 — AUTHOR-002: Start with a Python embedded DSL
 
-**Status:** Active
+**Status:** Superseded by AUTHOR-006
 
 Python supplies modules, names, functions for definition-time reuse, packaging,
 type checkers, completion, and syntax highlighting. It lets the language focus
@@ -54,3 +54,33 @@ silently serializing that code recreates the expression-runtime problem. The
 semantic escape hatch is an explicit provider; packaging automation can make it
 lighter later without hiding the boundary.
 
+## 2026-09-13 — AUTHOR-006: Adopt YAML as the first authoring surface
+
+**Status:** Active
+
+The first milestone values simplicity, language neutrality, and closeness to the
+IR more than host-language expression feedback. A constrained YAML document can
+be parsed by the compiler and inspected by operators without executing authoring
+code or reproducing a Python environment.
+
+The limited expression language is represented structurally with reserved YAML
+operators, so it is already an AST rather than a string program. This gives up
+some IDE type feedback compared with Python, but reduces staging, portability,
+security, and source-to-IR complexity at the point where the language is still
+being discovered.
+
+Typed embedded DSLs remain possible later as generators for the same IR. They
+are no longer part of the first milestone.
+
+## 2026-09-13 — AUTHOR-007: Remove source, call, and let from YAML
+
+**Status:** Active
+
+The previous syntax exposed distinctions the runtime can derive from one uniform
+producer model. A provider is a provider whether it waits on an event, performs a
+lookup, or runs an agent. A context entry containing an expression is already
+clearly a derivation, so `let` adds no information.
+
+The smaller surface makes YAML track the IR more directly: each register has an
+expression, provider, match, or map producer, and references provide all graph
+dependencies.

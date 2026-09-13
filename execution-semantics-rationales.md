@@ -5,7 +5,7 @@ This is a chronological, append-only decision log. It explains the design in
 
 ## 2026-09-13 — EXEC-001: Schedule eagerly from data readiness
 
-**Status:** Active
+**Status:** Refined by EXEC-006
 
 The desired behavior is reactive: all roots may start together, and every
 dependent starts as soon as its actual inputs are terminal. A central ordered
@@ -28,7 +28,7 @@ side effects; see its [durable execution guidance](https://docs.langchain.com/os
 
 ## 2026-09-13 — EXEC-003: Separate attempts from terminal fact assignment
 
-**Status:** Active
+**Status:** Superseded by EXEC-006
 
 Retries appear to conflict with single assignment only if every attempt is
 treated as a new value. Recording attempts as append-only operational facts and
@@ -37,7 +37,7 @@ dataflow semantics.
 
 ## 2026-09-13 — EXEC-004: Seal unselected branches
 
-**Status:** Active
+**Status:** Superseded by EXEC-006
 
 If unselected branches simply remain unresolved, downstream completeness cannot
 be distinguished from a stuck workflow. Explicit skipped terminals make branch
@@ -52,3 +52,25 @@ Parallel map items may finish in any order. Gathering by input index or canonica
 key makes downstream values independent of timing and gives retries stable child
 identities.
 
+## 2026-09-13 — EXEC-006: Make every assignment reactivate downstream producers
+
+**Status:** Active
+
+The earlier terminal-fact model hid the natural case where a provider produces a
+second value. The simpler rule is that every accepted push appends a register
+revision and creates new downstream activations. Expressions, branches, maps,
+and providers all participate in the same reactive mechanism.
+
+This removes implicit completion and branch sealing from the core. A branch
+selected for one discriminator revision remains historical when a later revision
+selects another branch; its past effects are not retracted.
+
+## 2026-09-13 — EXEC-007: Treat repeated correlation and equal values as events
+
+**Status:** Active
+
+Correlation chooses a context; it does not mean “execute once.” Suppressing a
+second emission because its key or payload repeats would introduce hidden
+cardinality or deduplication policy. The first milestone therefore records and
+propagates every accepted assignment. Explicit once, distinct, debounce, and
+coalescing policies can be added only when concrete use cases require them.

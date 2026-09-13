@@ -2,63 +2,89 @@
 
 ## Concepts
 
-- **Workflow definition**: an immutable, versioned graph specification.
-- **Workflow instance**: one correlated execution of a workflow definition.
-- **Fact**: a named value in an instance. An ordinary fact is assigned once.
-- **Node**: a definition that can produce one fact.
-- **Reference**: a statically visible dependency on another fact or a singular
-  path within it.
-- **Provider**: a versioned implementation behind a typed input/output contract.
-- **Outcome**: the terminal result of a provider call.
+- **Workflow definition**: an immutable, versioned producer graph.
+- **Workflow execution**: one activation of that definition and its durable
+  journals.
+- **Workflow instance**: the reactive state associated with one optional
+  correlation key inside an execution.
+- **Context**: the current register values of one workflow instance.
+- **Register**: one named context value backed by an append-only assignment log.
+- **Assignment**: one revision written to a register.
+- **Current value**: the latest assignment to a register.
+- **Producer**: an expression, provider, `match`, or `map` that can assign one
+  named register.
+- **Reference**: a statically visible dependency on the current value of another
+  register or a singular path within it.
+- **Activation**: one evaluation caused by a specific dependency-revision vector.
+- **Emission**: a value produced by a provider, optionally routed with a
+  correlation id.
 
-The workflow context is the set of facts currently known for an instance. It is
-not a mutable object handed to each node. Its apparent growth comes from facts
-reaching terminal assignment.
+The context is a materialized view over assignment logs, not a mutable dictionary
+whose history is discarded.
 
-## Minimal graph constructs
+## Minimal surface constructs
 
-The initial language has these semantic constructs:
+Each `context` entry defines one named register using one of:
 
-| Construct | Meaning |
+| Form | Meaning |
 | --- | --- |
-| `workflow` | Declares identity, version, inputs, outputs, and policies. |
-| `source` | Accepts external events and contributes correlated facts. |
-| `let` | Builds a value with the binding algebra; performs no provider call. |
-| `call` | Invokes a provider with declared bindings and produces an `Outcome`. |
-| `match` | Selects one finite branch from a terminal value or outcome. |
-| `map` | Applies a finite subgraph or provider call to each collection element and gathers the results. |
-| `output` | Names the facts exported as the workflow result. |
+| expression | Recompute a value from referenced current values. This is the default form. |
+| `provider` | Activate an integration component and append each emitted value. |
+| `match` | Select a producer branch from the current discriminator. |
+| `map` | Apply a nested producer graph to a finite collection. |
 
-References in a construct's inputs define its incoming edges. There is no
-separate `sequence`, `parallel`, or `join` construct:
+The workflow's top-level `outputs` list selects the registers exposed outside
+the graph; it is not itself a producer.
 
-- one dependency creates sequencing;
-- independent ready nodes create parallelism;
-- multiple dependencies create a join.
+There are no `source`, `call`, or `let` constructs. Event listeners and one-shot
+functions are both providers. A plain expression at a context entry needs no
+wrapper.
 
-## Assignment and growth
+References define incoming edges. There is no separate `sequence`, `parallel`,
+or `join` construct:
 
-An ordinary fact transitions from unresolved to exactly one terminal value.
-That assignment is immutable.
+- one dependency creates causal sequencing;
+- independent activations may execute in parallel;
+- multiple references form a reactive join over their current values.
 
-Growth is allowed only when its algebra and completion rule are declared. A
-finite `map` input is sealed before expansion. A future streaming collection
-must define key identity, duplicate handling, merge semantics, and a frontier
-or seal before absence or completion can be concluded.
+## Assignment
+
+Every accepted push appends a new revision to exactly one `(context, name)`
+register. It becomes that register's current value. Payload equality does not
+suppress an assignment or its downstream activations.
+
+Each register has one definition but its producer may assign it repeatedly.
+Multiple definitions for the same name are compile errors.
+
+Each assignment records producer identity, correlation context, cause,
+dependency revisions, and provider invocation/emission identity where applicable.
+
+## Activation
+
+At workflow startup, every producer without context dependencies activates once
+in the anonymous context. Creating a correlated workflow instance does not
+restart those root producers.
+
+After a register is assigned, every directly dependent producer becomes eligible
+for activation when all of its required references have current values. An
+activation captures those current dependency revisions as its input snapshot.
+
+Expressions evaluate once per activation. Providers may emit zero, one, or many
+assignments during an activation and may complete, fail, or remain open.
+
+## Correlation
+
+An emission with a correlation id targets the context with that key, creating it
+if necessary. An emission without one inherits its invocation's context; a root
+provider therefore writes to the anonymous context when it omits correlation.
+
+Creating a context copies no values from the originating context. Only the
+emitted named value is assigned there.
 
 ## Graph shape
 
-After treating `map` bodies as nested graph boundaries, an initial-version
-workflow is finite and acyclic. Providers may run internal loops, but those
-loops are not part of the outer workflow semantics.
+The first version is acyclic after treating `map` bodies as nested graph
+boundaries. Repeated execution comes from new assignments, not graph cycles.
 
-Dynamic task creation is limited to finite `map` expansion. Each expanded node
-receives a stable identity derived from the map node and item key or index.
-
-## Names and identity
-
-Every node has a stable logical identifier independent of source-code line
-number or declaration order. Renaming or structurally changing a node changes
-the compiled workflow version unless an explicit compatibility mapping is
-provided in a future version-migration design.
-
+Dynamic graph expansion is limited to finite `map`. Each expanded producer has
+a stable identity derived from the map node and item key or index.

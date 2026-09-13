@@ -46,7 +46,7 @@ closed algebra cross an explicit provider boundary.
 
 ## 2026-09-13 — VALUE-004: Restrict references to singular paths
 
-**Status:** Active
+**Status:** Refined by VALUE-006
 
 [RFC 9535 JSONPath](https://www.rfc-editor.org/rfc/rfc9535.html) distinguishes
 singular paths from queries that can select multiple nodes. Singular paths have
@@ -59,10 +59,35 @@ open, but all forms must lower to the same singular path IR.
 
 ## 2026-09-13 — VALUE-005: Distinguish absence from non-arrival
 
-**Status:** Active
+**Status:** Refined by VALUE-007
 
 In an event-driven workflow, “not present yet” is not evidence of absence.
 Conflating the two would make branch results depend on timing. Negative tests
 therefore require a terminal producer or sealed scope, and optional references
 produce an explicit option rather than `null`.
 
+## 2026-09-13 — VALUE-006: Encode the limited expression language structurally in YAML
+
+**Status:** Active
+
+The first authoring surface is now YAML rather than Python. Reserved one-key
+objects such as `$ref`, `$concat`, and `$eq` make each expression an explicit
+tree in the source document. The compiler does not need to parse arbitrary code
+from strings, and the authored form stays close to the IR.
+
+Singular RFC 9535 JSONPath supplies the reference syntax. Rich JSONPath queries
+remain excluded because they would conceal collection cardinality and fan-out
+inside an expression.
+
+## 2026-09-13 — VALUE-007: Make ordinary references select the latest revision
+
+**Status:** Active
+
+Once context names became versioned registers, reference semantics needed a
+simple default. A reference captures the register's latest assignment when its
+consumer activates and records that revision as provenance.
+
+Presence and negation now describe that captured snapshot rather than a final
+world state. A value absent now may appear later and cause another activation.
+Historical revision selection can be added separately if workflows demonstrate
+the need.

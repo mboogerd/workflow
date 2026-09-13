@@ -17,7 +17,7 @@ interpreted under a newly deployed, incompatible graph.
 
 ## 2026-09-13 — INSTANCE-002: Declare source cardinality
 
-**Status:** Active
+**Status:** Superseded by INSTANCE-005
 
 A source expected exactly once has different duplicate and completion semantics
 from an accumulating source. Declaring `one` versus `many` makes conflicts,
@@ -25,7 +25,7 @@ deduplication, and collection identity statically visible.
 
 ## 2026-09-13 — INSTANCE-003: Require explicit closure for negative conclusions
 
-**Status:** Active
+**Status:** Deferred by INSTANCE-005
 
 An open event stream can always produce another item, so neither “all items
 arrived” nor “no matching event exists” follows from current state alone. A
@@ -36,9 +36,22 @@ This is the event-lifecycle counterpart of the language's monotonicity rule.
 
 ## 2026-09-13 — INSTANCE-004: Make duplicate handling identity-based
 
-**Status:** Active
+**Status:** Deferred by INSTANCE-005
 
 At-least-once delivery is normal for integrations. Stable event ids make
 deduplication deterministic. Conflicting content under the same id is surfaced
 as corruption or protocol error rather than resolved by arrival order.
 
+## 2026-09-13 — INSTANCE-005: Make correlation routing permissive and reactive
+
+**Status:** Active
+
+A provider emission either supplies a correlation id or inherits its current
+context. A new id creates a keyed context; an existing id receives another
+assignment. Repeating an id is potentially useful and is not treated as an
+error, duplicate, or once-only invocation.
+
+Cardinality, deduplication, and closure are therefore removed from the first
+language milestone. They remain plausible explicit policies if unrestricted
+push behavior proves difficult in real workflows. The runtime still logs every
+assignment so later policy can be explained and replayed.
