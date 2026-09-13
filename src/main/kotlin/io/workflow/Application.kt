@@ -1,12 +1,16 @@
 package io.workflow
 
+import io.workflow.core.CanonicalValueJson
+import io.workflow.core.Value
 import io.workflow.compiler.WorkflowCompiler
+import io.workflow.runtime.InMemoryWorkflowRunner
+import io.workflow.runtime.WorkflowExecutionException
 import java.nio.file.Files
 import java.nio.file.Path
 
 fun main(args: Array<String>) {
     if (args.isEmpty() || args.first() == "--help") {
-        println("No command was given. Workflow runtime commands are not available yet.")
+        println("No command was given. Use validate, compile, run, or inspect.")
         return
     }
     when (args.first()) {
@@ -32,8 +36,9 @@ fun main(args: Array<String>) {
             Files.writeString(Path.of(args[outputIndex + 1]), result.ir!!.canonicalJson() + "\n")
             println(args[outputIndex + 1])
         }
+        "run", "inspect" -> runFile(args, inspectionOnly = args.first() == "inspect")
         else -> {
-            System.err.println("unknown command '${args.first()}'; use validate or compile")
+            System.err.println("unknown command '${args.first()}'; use validate, compile, run, or inspect")
             kotlin.system.exitProcess(2)
         }
     }
@@ -50,4 +55,50 @@ private fun compileFile(args: Array<String>) = run {
         kotlin.system.exitProcess(2)
     }
     WorkflowCompiler().compile(Files.readString(path))
+}
+
+private fun runFile(args: Array<String>, inspectionOnly: Boolean) {
+    if (args.size < 2) {
+        System.err.println("${args.first()} requires a YAML path")
+        kotlin.system.exitProcess(2)
+    }
+    val yamlPath = Path.of(args[1])
+    if (!Files.isRegularFile(yamlPath)) {
+        System.err.println("YAML file not found: $yamlPath")
+        kotlin.system.exitProcess(2)
+    }
+    val parameterIndex = args.indexOf("--parameters")
+    if (parameterIndex < 0 || parameterIndex + 1 >= args.size) {
+        System.err.println("${args.first()} requires --parameters <json>")
+        kotlin.system.exitProcess(2)
+    }
+    val parameterSource = args[parameterIndex + 1]
+    val parameterPath = runCatching { Path.of(parameterSource) }.getOrNull()
+    val parameterText = parameterPath?.takeIf(Files::isRegularFile)?.let(Files::readString) ?: parameterSource
+    val parameters = try {
+        when (val decoded = CanonicalValueJson.decode(parameterText)) {
+            is Value.ObjectValue -> decoded.fields
+            else -> throw WorkflowExecutionException("parameters JSON must be an object")
+        }
+    } catch (failure: Exception) {
+        System.err.println("invalid parameters JSON: ${failure.message ?: "parse error"}")
+        kotlin.system.exitProcess(1)
+    }
+    val compiler = WorkflowCompiler()
+    val compilation = compiler.compile(Files.readString(yamlPath))
+    if (!compilation.isValid) {
+        compilation.diagnostics.forEach { System.err.println(it) }
+        kotlin.system.exitProcess(1)
+    }
+    val result = try {
+        InMemoryWorkflowRunner(compiler = compiler).execute(compilation.ir!!, parameters)
+    } catch (failure: Exception) {
+        System.err.println("workflow execution failed: ${failure.message ?: "execution error"}")
+        kotlin.system.exitProcess(1)
+    }
+    if (!result.isSuccessful) {
+        result.failures.forEach { System.err.println("workflow activation failed: $it") }
+        kotlin.system.exitProcess(1)
+    }
+    println(if (inspectionOnly || args.contains("--inspect")) result.inspectionJson() else result.outputsJson())
 }
