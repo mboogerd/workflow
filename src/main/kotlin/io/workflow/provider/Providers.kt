@@ -60,7 +60,8 @@ data class ProviderDescriptor(
     val compatibility: ProviderCompatibility = ProviderCompatibility(),
     /** Configuration fields which must be known at deployment time. */
     val deploymentStaticConfigFields: Set<String> = emptySet(),
-    val policySchema: ValueSchema = ValueSchema.Object(emptyMap()),
+    /** Descriptors may further constrain policy fields; v1 baseline fields remain portable. */
+    val policySchema: ValueSchema = ValueSchema.Object(emptyMap(), additionalFields = true),
 ) {
     init {
         require(providerId.isNotBlank()) { "provider id must not be blank" }
@@ -114,6 +115,12 @@ sealed interface ProviderLifecycleMessage {
 
 fun interface ProviderImplementation {
     fun invoke(request: ProviderInvocationRequest): Iterable<ProviderLifecycleMessage>
+}
+
+/** Optional cooperative control channel for a provider that remains open. */
+interface CancellableProviderImplementation : ProviderImplementation {
+    /** Returns false when the implementation observed but could not honour cancellation. */
+    fun cancel(request: ProviderInvocationRequest): Boolean
 }
 
 data class RegisteredProvider(

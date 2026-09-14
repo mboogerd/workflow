@@ -35,6 +35,10 @@ import io.workflow.core.validate
 import io.workflow.provider.ProviderInvocationRequest
 import io.workflow.provider.ProviderLifecycleMessage
 import io.workflow.provider.ProviderRegistry
+import io.workflow.provider.ProviderExecutionPolicy
+import io.workflow.provider.EffectClass
+import io.workflow.provider.errorClass
+import io.workflow.provider.CancellableProviderImplementation
 import java.security.MessageDigest
 import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
@@ -110,6 +114,9 @@ enum class ProviderEventType {
     COMPLETED,
     OPEN,
     CANCELLED,
+    RETRY_SCHEDULED,
+    ATTEMPT_TIMED_OUT,
+    CANCELLATION_IGNORED,
     FAILED;
 
     companion object {
@@ -976,6 +983,7 @@ class InMemoryWorkflowRunner(
         val attemptId: AttemptId,
         val startedAt: Instant,
         val seenEmissionIds: MutableSet<EmissionId>,
+        val request: ProviderInvocationRequest? = null,
         val lock: Any = Any(),
     )
 
@@ -1500,6 +1508,19 @@ class InMemoryWorkflowRunner(
         session.openProviders.values.toList().forEach { state ->
             synchronized(state.lock) {
                 if (journal.isOpen(state.intent.id)) {
+                    val binding = state.register.provider!!
+                    val implementation = providerRegistry.resolve(binding.providerId, binding.version)?.implementation
+                    val cancelled = if (implementation is CancellableProviderImplementation && state.request != null) {
+                        runCatching { implementation.cancel(state.request) }.getOrDefault(false)
+                    } else false
+                    if (!cancelled) {
+                        recordProviderEvent(
+                            state.workflow, state.intent, state.invocationId, state.attemptId,
+                            ProviderEventType.CANCELLATION_IGNORED,
+                            causationId = "admin-stop-${executionId.value}", register = state.register,
+                            diagnostic = "CANCELLATION_NOT_ACKNOWLEDGED",
+                        )
+                    }
                     recordProviderEvent(
                         state.workflow,
                         state.intent,
@@ -1685,6 +1706,7 @@ class InMemoryWorkflowRunner(
                             ?: throw WorkflowExecutionException("open provider '${register.name}' has no attempt id"),
                         startedAt = started,
                         seenEmissionIds = result.emissionIds.toMutableSet(),
+                        request = result.request,
                     )
                 }
                 else journal.completeActivation(intent.id)
@@ -1875,6 +1897,7 @@ class InMemoryWorkflowRunner(
         val attemptId: AttemptId?,
         val failure: String? = null,
         val emissionIds: Set<EmissionId> = emptySet(),
+        val request: ProviderInvocationRequest? = null,
     )
 
     private data class MapItem(
@@ -2242,6 +2265,10 @@ class InMemoryWorkflowRunner(
         context: Map<RegisterId, AssignmentMutation>,
         intent: ActivationIntent,
         register: CompiledRegister,
+        invocationOverride: InvocationId? = null,
+        invocationCausation: String? = null,
+        attemptNumber: Int = 1,
+        activationStartedAt: Instant = clock.now(),
     ): ProviderExecutionResult {
         val binding = register.provider ?: error("provider binding is missing")
         val registration = providerRegistry.resolve(binding.providerId, binding.version)
@@ -2254,22 +2281,26 @@ class InMemoryWorkflowRunner(
                 "PROVIDER_NOT_FOUND: provider ${binding.providerId}@${binding.version} is not registered",
             )
         val descriptor = registration.descriptor
-        val invocationId = invocationId(intent)
+        val invocationId = invocationOverride ?: invocationId(intent)
+        val policy = ProviderExecutionPolicy.from(binding.policy)
+        if (policy.activationDeadline != null && java.time.Duration.between(activationStartedAt, clock.now()) > policy.activationDeadline) {
+            val diagnostic = "ACTIVATION_DEADLINE_EXCEEDED: limitMillis=${policy.activationDeadline.toMillis()}"
+            recordProviderEvent(
+                workflow, intent, invocationId, null, ProviderEventType.ATTEMPT_TIMED_OUT,
+                causationId = invocationCausation ?: intent.id.value, register = register, diagnostic = diagnostic,
+            )
+            return ProviderExecutionResult(ProviderActivationStatus.COMPLETED, invocationId, null, diagnostic)
+        }
         val scope = evaluationScope(intent)
         val input = materialize(evaluate(binding.input, workflow, parameters, context, scope))
         val config = materialize(evaluate(binding.config, workflow, parameters, context, scope))
         validateProviderBinding(descriptor.inputSchema.validate(input), "provider input")
         validateProviderBinding(descriptor.configurationSchema.validate(config), "provider configuration")
 
-        val invocationEvent = recordProviderEvent(
-            workflow,
-            intent,
-            invocationId,
-            null,
-            ProviderEventType.INVOCATION,
-            causationId = intent.id.value,
-            register = register,
-        )
+        val invocationEventId = invocationCausation ?: recordProviderEvent(
+            workflow, intent, invocationId, null, ProviderEventType.INVOCATION,
+            causationId = intent.id.value, register = register,
+        ).eventId
 
         val implementation = registration.implementation
             ?: return failedProvider(
@@ -2279,7 +2310,7 @@ class InMemoryWorkflowRunner(
                 invocationId,
                 null,
                 "PROVIDER_UNAVAILABLE: provider ${binding.providerId}@${binding.version} has no in-process implementation",
-                invocationEvent.eventId,
+                invocationEventId,
             )
         val attemptId = AttemptId("attempt-${nextId()}")
         val attemptEvent = recordProviderEvent(
@@ -2288,7 +2319,7 @@ class InMemoryWorkflowRunner(
             invocationId,
             attemptId,
             ProviderEventType.ATTEMPT_STARTED,
-            causationId = invocationEvent.eventId,
+            causationId = invocationEventId,
             register = register,
         )
         val request = ProviderInvocationRequest(
@@ -2302,6 +2333,7 @@ class InMemoryWorkflowRunner(
             parentActivationId = intent.parentActivationId,
             discriminatorRevision = intent.discriminatorRevision,
         )
+        val attemptStartedAt = clock.now()
         val messages = try {
             implementation.invoke(request)
         } catch (failure: Throwable) {
@@ -2316,12 +2348,13 @@ class InMemoryWorkflowRunner(
                 register = register,
                 diagnostic = diagnostic,
             )
-            return ProviderExecutionResult(ProviderActivationStatus.COMPLETED, invocationId, attemptId, diagnostic)
+            return retryOrReturn(workflow, parameters, context, intent, register, invocationId, invocationEventId, attemptNumber, policy, descriptor.effectClass, attemptId, diagnostic, null)
         }
 
         val seenEmissionIds = mutableSetOf<EmissionId>()
         var terminal: ProviderEventType? = null
         var terminalFailure: String? = null
+        var terminalError: Value? = null
         try {
             for (message in messages) {
                 if (terminal != null) {
@@ -2501,6 +2534,7 @@ class InMemoryWorkflowRunner(
                             diagnostic = diagnostic,
                         )
                         terminalFailure = diagnostic
+                        terminalError = message.error
                     }
                 }
             }
@@ -2516,7 +2550,19 @@ class InMemoryWorkflowRunner(
                 register = register,
                 diagnostic = diagnostic,
             )
-            return ProviderExecutionResult(ProviderActivationStatus.COMPLETED, invocationId, attemptId, diagnostic)
+            return retryOrReturn(workflow, parameters, context, intent, register, invocationId, invocationEventId, attemptNumber, policy, descriptor.effectClass, attemptId, diagnostic, null)
+        }
+        if (policy.attemptTimeout != null && java.time.Duration.between(attemptStartedAt, clock.now()) > policy.attemptTimeout) {
+            val diagnostic = "ATTEMPT_TIMEOUT: limitMillis=${policy.attemptTimeout.toMillis()}"
+            recordProviderEvent(
+                workflow, intent, invocationId, attemptId, ProviderEventType.ATTEMPT_TIMED_OUT,
+                causationId = attemptEvent.eventId, register = register, diagnostic = diagnostic,
+            )
+            recordProviderEvent(
+                workflow, intent, invocationId, attemptId, ProviderEventType.FAILED,
+                causationId = attemptEvent.eventId, register = register, diagnostic = diagnostic,
+            )
+            return retryOrReturn(workflow, parameters, context, intent, register, invocationId, invocationEventId, attemptNumber, policy, descriptor.effectClass, attemptId, diagnostic, null)
         }
         if (terminal == null) {
             return protocolFailure(
@@ -2529,12 +2575,55 @@ class InMemoryWorkflowRunner(
                 "PROTOCOL_MISSING_TERMINAL: provider stream ended without a terminal lifecycle message",
             )
         }
+        if (terminalFailure != null) {
+            return retryOrReturn(workflow, parameters, context, intent, register, invocationId, invocationEventId, attemptNumber, policy, descriptor.effectClass, attemptId, terminalFailure, terminalError)
+        }
         return ProviderExecutionResult(
             if (terminal == ProviderEventType.OPEN) ProviderActivationStatus.OPEN else ProviderActivationStatus.COMPLETED,
             invocationId,
             attemptId,
             terminalFailure,
             seenEmissionIds.toSet(),
+            request,
+        )
+    }
+
+    /**
+     * Retry decisions are events before the next physical attempt is started.
+     * The runner deliberately never sleeps: the due time is durable audit data,
+     * while an injected clock makes a resumed scheduler deterministic.
+     */
+    private fun retryOrReturn(
+        workflow: WorkflowIrDocument,
+        parameters: Map<String, Value>,
+        context: Map<RegisterId, AssignmentMutation>,
+        intent: ActivationIntent,
+        register: CompiledRegister,
+        invocationId: InvocationId,
+        invocationEventId: String,
+        attemptNumber: Int,
+        policy: ProviderExecutionPolicy,
+        effectClass: EffectClass,
+        attemptId: AttemptId,
+        diagnostic: String,
+        error: Value?,
+    ): ProviderExecutionResult {
+        val errorClass = error?.errorClass()
+        val retryable = policy.retryableErrorClasses.isEmpty() || errorClass in policy.retryableErrorClasses
+        if (attemptNumber >= policy.maximumAttempts || !retryable || effectClass !in setOf(EffectClass.PURE, EffectClass.READ)) {
+            return ProviderExecutionResult(ProviderActivationStatus.COMPLETED, invocationId, attemptId, diagnostic)
+        }
+        val delay = policy.backoffForRetry(attemptNumber)
+        val due = clock.now().plus(delay)
+        recordProviderEvent(
+            workflow, intent, invocationId, attemptId, ProviderEventType.RETRY_SCHEDULED,
+            causationId = invocationEventId, register = register,
+            diagnostic = "RETRY_SCHEDULED: attempt=${attemptNumber + 1}; dueAt=$due; delayMillis=${delay.toMillis()}; errorClass=${errorClass ?: "unclassified"}",
+        )
+        return executeProvider(
+            workflow, parameters, context, intent, register,
+            invocationOverride = invocationId, invocationCausation = invocationEventId,
+            attemptNumber = attemptNumber + 1,
         )
     }
 

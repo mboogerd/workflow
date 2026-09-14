@@ -21,6 +21,8 @@ import io.workflow.core.validate
 import io.workflow.provider.ProviderDescriptor
 import io.workflow.provider.ProviderKey
 import io.workflow.provider.ProviderRegistry
+import io.workflow.provider.ProviderExecutionPolicy
+import io.workflow.provider.EffectClass
 import java.math.BigDecimal
 import java.math.BigInteger
 import java.security.MessageDigest
@@ -799,6 +801,23 @@ class WorkflowCompiler(
         val policy = map.get<YamlNode>("policy")?.let(::rawValue) ?: Value.ObjectValue(emptyMap())
         descriptor.policySchema.validate(policy).errors.forEach { error ->
             diagnostics += Diagnostic("policy ${error.message}", "$path.policy${error.path.removePrefix("$")}", map.get<YamlNode>("policy")?.location?.source() ?: node.location.source())
+        }
+        try {
+            val executionPolicy = ProviderExecutionPolicy.from(policy)
+            if (executionPolicy.maximumAttempts > 1 && descriptor.effectClass !in setOf(EffectClass.PURE, EffectClass.READ)) {
+                diagnostics += Diagnostic("retry policy is unsafe for ${descriptor.effectClass.name.lowercase()} providers; reconciliation is required", "$path.policy", map.get<YamlNode>("policy")?.location?.source() ?: node.location.source())
+            }
+            if (executionPolicy.attemptTimeout != null && !descriptor.lifecycle.supportsTimeout) {
+                diagnostics += Diagnostic("attempt timeout requires provider lifecycle timeout support", "$path.policy", map.get<YamlNode>("policy")?.location?.source() ?: node.location.source())
+            }
+            if (executionPolicy.cancellationGrace != null && !descriptor.lifecycle.supportsCancellation) {
+                diagnostics += Diagnostic("cancellation grace requires provider lifecycle cancellation support", "$path.policy", map.get<YamlNode>("policy")?.location?.source() ?: node.location.source())
+            }
+            if (executionPolicy.backoffSchedule.size > (executionPolicy.maximumAttempts - 1)) {
+                diagnostics += Diagnostic("backoff schedule has more entries than retry opportunities", "$path.policy", map.get<YamlNode>("policy")?.location?.source() ?: node.location.source())
+            }
+        } catch (failure: IllegalArgumentException) {
+            diagnostics += Diagnostic("invalid execution policy: ${failure.message}", "$path.policy", map.get<YamlNode>("policy")?.location?.source() ?: node.location.source())
         }
         return CompiledProvider(providerId, providerVersion, config, input, requestedCapabilities.toSet(), policy)
     }
