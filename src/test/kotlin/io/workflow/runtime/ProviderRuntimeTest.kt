@@ -99,8 +99,28 @@ class ProviderRuntimeTest {
 
         assertTrue(result.isSuccessful, result.failures.joinToString())
         assertEquals(ActivationRecord.Status.OPEN, result.journal.activations().single().status)
+        assertEquals(null, result.journal.activations().single().completedAt)
         assertFalse(result.journal.isCompleted(result.journal.activationIntents().single().id))
         assertTrue(result.inspectionJson().contains("\"state\":\"open\""))
+    }
+
+    @Test
+    fun `stream ending without a terminal message is a protocol failure`() {
+        val registry = registry { request ->
+            listOf(
+                ProviderLifecycleMessage.Emission(
+                    Value.StringValue("unterminated"), EmissionId("one"), request.invocationId, request.attemptId,
+                ),
+            )
+        }
+        val result = InMemoryWorkflowRunner(compiler = WorkflowCompiler(registry)).run(
+            yaml(), executionId = ExecutionId("unterminated-execution"),
+        )
+
+        assertFalse(result.isSuccessful)
+        assertTrue(result.failures.single().contains("PROTOCOL_MISSING_TERMINAL"))
+        assertEquals(1, result.journal.assignments().count { it.emissionId != null })
+        assertEquals(ActivationRecord.Status.FAILED, result.journal.activations().single { it.invocationId != null }.status)
     }
 
     @Test
@@ -258,5 +278,62 @@ class ProviderRuntimeTest {
         assertEquals(2, result.journal.providerInvocations().size)
         assertEquals(2, result.journal.assignments().size)
         assertEquals(2, result.journal.providerEmissions().count { it.kind == ProviderEventType.EMISSION_ACCEPTED })
+    }
+
+    @Test
+    fun `journal commit order is authoritative for parallel providers`() {
+        val bothEntered = CountDownLatch(2)
+        val secondCommitted = CountDownLatch(1)
+        val registry = ProviderRegistry()
+        registry.register(descriptor("first-provider")) { request ->
+            bothEntered.countDown()
+            check(bothEntered.await(5, TimeUnit.SECONDS))
+            check(secondCommitted.await(5, TimeUnit.SECONDS))
+            listOf(
+                ProviderLifecycleMessage.Emission(
+                    Value.StringValue("first"), EmissionId("first"), request.invocationId, request.attemptId,
+                ),
+                ProviderLifecycleMessage.Completed,
+            )
+        }
+        registry.register(descriptor("second-provider")) { request ->
+            bothEntered.countDown()
+            check(bothEntered.await(5, TimeUnit.SECONDS))
+            sequence {
+                yield(
+                    ProviderLifecycleMessage.Emission(
+                        Value.StringValue("second"), EmissionId("second"), request.invocationId, request.attemptId,
+                    ),
+                )
+                // Sequence execution resumes only after the runtime has accepted
+                // and committed the yielded emission.
+                secondCommitted.countDown()
+                yield(ProviderLifecycleMessage.Completed)
+            }.asIterable()
+        }
+
+        val result = InMemoryWorkflowRunner(
+            compiler = WorkflowCompiler(registry),
+            workerCount = 2,
+        ).run(
+            """
+            workflow:
+              id: authoritative-order
+              version: 1
+              context:
+                first: {provider: first-provider, version: 1}
+                second: {provider: second-provider, version: 1}
+              outputs: [first, second]
+            """.trimIndent(),
+            executionId = ExecutionId("authoritative-order-execution"),
+        )
+
+        assertTrue(result.isSuccessful, result.failures.joinToString())
+        assertEquals(
+            listOf(Value.StringValue("second"), Value.StringValue("first")),
+            result.journal.assignments().map { it.value },
+        )
+        assertEquals(Value.StringValue("first"), result.outputs.getValue("first").value)
+        assertEquals(Value.StringValue("second"), result.outputs.getValue("second").value)
     }
 }

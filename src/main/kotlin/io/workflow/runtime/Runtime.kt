@@ -610,6 +610,8 @@ class InMemoryWorkflowRunner(
     private val providerRegistry: ProviderRegistry = compiler.providerRegistry,
     private val workerCount: Int = DEFAULT_WORKER_COUNT,
 ) {
+    private val assignmentCommitLock = Any()
+
     constructor(providerRegistry: ProviderRegistry) : this(
         compiler = WorkflowCompiler(providerRegistry),
         providerRegistry = providerRegistry,
@@ -1055,27 +1057,14 @@ class InMemoryWorkflowRunner(
             return ProviderExecutionResult(ProviderActivationStatus.COMPLETED, invocationId, attemptId, diagnostic)
         }
         if (terminal == null) {
-            if (!descriptor.lifecycle.completes) {
-                return protocolFailure(
-                    workflow,
-                    intent,
-                    register,
-                    invocationId,
-                    attemptId,
-                    attemptEvent.eventId,
-                    "PROTOCOL_MISSING_TERMINAL: provider stream ended without an allowed terminal lifecycle message",
-                )
-            }
-            terminal = ProviderEventType.COMPLETED
-            recordProviderEvent(
+            return protocolFailure(
                 workflow,
                 intent,
+                register,
                 invocationId,
                 attemptId,
-                ProviderEventType.COMPLETED,
-                causationId = attemptEvent.eventId,
-                register = register,
-                diagnostic = "provider lifecycle ended after zero or more emissions",
+                attemptEvent.eventId,
+                "PROTOCOL_MISSING_TERMINAL: provider stream ended without a terminal lifecycle message",
             )
         }
         return ProviderExecutionResult(
@@ -1326,30 +1315,24 @@ class InMemoryWorkflowRunner(
             occurredAt = clock.now(),
             mutationOrdinal = 0,
         )
-        val currentWithCandidate = journal.allCurrent() + (RegisterKey(intent.executionId, contextId, register.registerId) to candidate)
-        val downstream = planner.afterAssignment(
-            workflow,
-            intent.executionId,
-            contextId,
-            candidate,
-            currentWithCandidate,
-            batchId,
-            clock.now(),
-        )
-        journal.commit(JournalBatch(batchId, listOf(candidate), clock.now()), downstream)
-        // A concurrent sibling may have committed between the planning snapshot
-        // above and this batch. Re-plan from the journal's settled view so a
-        // multi-input dependent cannot be lost when both roots race.
-        val settledDownstream = planner.afterAssignment(
-            workflow,
-            intent.executionId,
-            contextId,
-            candidate,
-            journal.allCurrent(),
-            batchId,
-            clock.now(),
-        )
-        journal.persistActivationIntents(settledDownstream)
+        // Journal order is serialized here so the planner sees every earlier
+        // commit and the assignment becomes visible atomically with all intents
+        // derived from that exact view. In particular, concurrent roots cannot
+        // expose the second half of a join before its runnable intent exists.
+        synchronized(assignmentCommitLock) {
+            val currentWithCandidate = journal.allCurrent() +
+                (RegisterKey(intent.executionId, contextId, register.registerId) to candidate)
+            val downstream = planner.afterAssignment(
+                workflow,
+                intent.executionId,
+                contextId,
+                candidate,
+                currentWithCandidate,
+                batchId,
+                clock.now(),
+            )
+            journal.commit(JournalBatch(batchId, listOf(candidate), clock.now()), downstream)
+        }
     }
 
     private fun recordActivation(
@@ -1372,7 +1355,7 @@ class InMemoryWorkflowRunner(
                 dependencyRevisions = intent.dependencyRevisions,
                 status = status,
                 startedAt = startedAt,
-                completedAt = clock.now(),
+                completedAt = if (status == ActivationRecord.Status.OPEN) null else clock.now(),
                 failure = failure,
                 invocationId = invocationId,
                 attemptId = attemptId,
