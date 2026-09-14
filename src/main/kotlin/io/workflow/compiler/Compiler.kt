@@ -82,7 +82,7 @@ data class CompiledRegister(
 data class CompiledProvider(
     val providerId: String,
     val version: Int,
-    val config: Value,
+    val config: Expression,
     val input: Expression,
     val capabilities: Set<String> = emptySet(),
     val policy: Value = Value.ObjectValue(emptyMap()),
@@ -193,6 +193,11 @@ class WorkflowCompiler(
         val depsByName = definitions.mapValues { (_, pair) -> dependencies(pair.second).filter { it in names }.distinct().sorted() }
         detectCycles(depsByName, diagnostics, definitions)
         val inferred = mutableMapOf<String, ValueSchema>()
+        providerDefinitions.forEach { (name, provider) ->
+            providerRegistry.resolve(provider.providerId, provider.version)?.descriptor?.let { descriptor ->
+                inferred[name] = descriptor.emissionSchema
+            }
+        }
         val inferring = mutableSetOf<String>()
         fun inferRegister(name: String): ValueSchema {
             inferred[name]?.let { return it }
@@ -228,6 +233,23 @@ class WorkflowCompiler(
         }
         providerDefinitions.forEach { (name, provider) ->
             val descriptor = providerRegistry.resolve(provider.providerId, provider.version)?.descriptor ?: return@forEach
+            val configSchema = inferExpression(
+                provider.config,
+                parameters,
+                inferred,
+                definitions.keys,
+                emptySet(),
+                diagnostics,
+                "$.workflow.context.$name.config",
+                definitions.getValue(name).first.location.source(),
+            )
+            if (!configSchema.isCompatibleWith(descriptor.configurationSchema)) {
+                diagnostics += Diagnostic(
+                    "configuration schema ${schemaName(configSchema)} is incompatible with provider configuration ${schemaName(descriptor.configurationSchema)}",
+                    "$.workflow.context.$name.config",
+                    definitions.getValue(name).first.location.source(),
+                )
+            }
             val inputSchema = inferExpression(
                 provider.input,
                 parameters,
@@ -318,13 +340,10 @@ class WorkflowCompiler(
         }
 
         val configNode = map.get<YamlNode>("config")
-        val config = configNode?.let { rawValue(it) } ?: Value.ObjectValue(emptyMap())
+        val config = configNode?.let { parseExpression(it, "$path.config", diagnostics) }
+            ?: Expression.ObjectValue(emptyMap())
         if (configNode != null) {
             staticConfigReferences(configNode, "$path.config", descriptor, diagnostics)
-        }
-        val configValidation = descriptor.configurationSchema.validate(config)
-        configValidation.errors.forEach { error ->
-            diagnostics += Diagnostic("configuration ${error.message}", "$path.config${error.path.removePrefix("$")}", configNode?.location?.source() ?: node.location.source())
         }
 
         val withNode = map.get<YamlNode>("with")
@@ -830,7 +849,7 @@ private object CanonicalIrJson {
             fields["provider"] = JsonObject(linkedMapOf(
                 "providerId" to JsonPrimitive(provider.providerId),
                 "version" to JsonPrimitive(provider.version),
-                "config" to jsonValue(provider.config),
+                "config" to expression(provider.config),
                 "input" to expression(provider.input),
                 "capabilities" to JsonArray(provider.capabilities.sorted().map(::JsonPrimitive)),
                 "policy" to jsonValue(provider.policy),

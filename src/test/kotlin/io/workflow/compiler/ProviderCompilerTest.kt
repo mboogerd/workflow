@@ -8,6 +8,10 @@ import io.workflow.provider.ProviderInvocationRequest
 import io.workflow.provider.ProviderLifecycle
 import io.workflow.provider.ProviderLifecycleMessage
 import io.workflow.provider.ProviderRegistry
+import io.workflow.provider.ProviderCompatibility
+import io.workflow.core.AttemptId
+import io.workflow.core.EmissionId
+import io.workflow.core.InvocationId
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
@@ -110,6 +114,50 @@ class ProviderCompilerTest {
     }
 
     @Test
+    fun `static config accepts parameter bindings and does not infer them as context dependencies`() {
+        val result = WorkflowCompiler(providerRegistry = registry()).compile("""
+            workflow:
+              id: parameter-config
+              version: 1
+              parameters:
+                region: {schema: string}
+              context:
+                greeting:
+                  provider: greeter
+                  version: 1
+                  config: {region: {${'$'}ref: '${'$'}.parameters.region'}}
+                  with: {name: Ada}
+              outputs: [greeting]
+        """.trimIndent())
+        assertTrue(result.isValid, result.diagnostics.joinToString())
+        assertTrue(result.ir!!.registers.single().dependencies.isEmpty())
+        assertTrue(result.ir!!.canonicalJson().contains("\"root\":\"parameters\""))
+    }
+
+    @Test
+    fun `provider emission schema feeds downstream binding validation`() {
+        val result = WorkflowCompiler(providerRegistry = registry()).compile("""
+            workflow:
+              id: chained-providers
+              version: 1
+              context:
+                first:
+                  provider: greeter
+                  version: 1
+                  config: {region: eu}
+                  with: {name: Ada}
+                second:
+                  provider: greeter
+                  version: 1
+                  config: {region: eu}
+                  with: {name: {${'$'}ref: '${'$'}.first.message'}}
+              outputs: [second]
+        """.trimIndent())
+        assertTrue(result.isValid, result.diagnostics.joinToString())
+        assertEquals(listOf("first"), result.ir!!.registers.single { it.name == "second" }.dependencies)
+    }
+
+    @Test
     fun `registry rejects duplicate exact identity and unsupported protocol`() {
         val registry = ProviderRegistry()
         val descriptor = ProviderDescriptor("same", 1, ValueSchema.Any, ValueSchema.Any)
@@ -119,13 +167,22 @@ class ProviderCompilerTest {
         val unsupported = ProviderDescriptor("future", 1, ValueSchema.Any, ValueSchema.Any, protocolFormatVersion = 2)
         val failure = assertThrows(IllegalArgumentException::class.java) { registry.register(unsupported) }
         assertTrue(failure.message!!.contains("unsupported protocol format version 2"))
+        val incompatible = ProviderDescriptor(
+            "incompatible",
+            1,
+            ValueSchema.Any,
+            ValueSchema.Any,
+            compatibility = ProviderCompatibility(setOf(2)),
+        )
+        val incompatibleFailure = assertThrows(IllegalArgumentException::class.java) { registry.register(incompatible) }
+        assertTrue(incompatibleFailure.message!!.contains("incompatible with supported IR"))
     }
 
     @Test
     fun `protocol models zero many and open lifecycle streams`() {
         val messages: List<ProviderLifecycleMessage> = listOf(
-            ProviderLifecycleMessage.Emission(Value.StringValue("a"), "e1"),
-            ProviderLifecycleMessage.Emission(Value.StringValue("b"), "e2", "correlation"),
+            ProviderLifecycleMessage.Emission(Value.StringValue("a"), EmissionId("e1"), InvocationId("i"), AttemptId("a")),
+            ProviderLifecycleMessage.Emission(Value.StringValue("b"), EmissionId("e2"), InvocationId("i"), AttemptId("a"), "correlation"),
             ProviderLifecycleMessage.Completed,
         )
         assertEquals(3, messages.size)

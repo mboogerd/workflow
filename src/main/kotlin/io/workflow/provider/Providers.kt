@@ -4,6 +4,7 @@ import io.workflow.core.Value
 import io.workflow.core.ValueSchema
 import io.workflow.core.InvocationId
 import io.workflow.core.AttemptId
+import io.workflow.core.EmissionId
 
 /** The effect classification used by a provider descriptor. */
 enum class EffectClass { PURE, READ, EFFECT, AGENTIC }
@@ -29,6 +30,16 @@ data class IdempotencyContract(
     val key: String = "logical-invocation-id",
 )
 
+/** Versions of portable artifacts with which this descriptor is compatible. */
+data class ProviderCompatibility(
+    val irFormatVersions: Set<Int> = setOf(1),
+) {
+    init {
+        require(irFormatVersions.isNotEmpty()) { "provider compatibility must declare at least one IR format version" }
+        require(irFormatVersions.all { it > 0 }) { "provider IR format versions must be positive" }
+    }
+}
+
 /** A descriptor points at an implementation but contains no implementation code. */
 data class ProviderDescriptor(
     val providerId: String,
@@ -44,6 +55,7 @@ data class ProviderDescriptor(
     val idempotency: IdempotencyContract = IdempotencyContract(),
     val implementationBinding: String = "in-process",
     val protocolFormatVersion: Int = 1,
+    val compatibility: ProviderCompatibility = ProviderCompatibility(),
     /** Configuration fields which must be known at deployment time. */
     val deploymentStaticConfigFields: Set<String> = emptySet(),
     val policySchema: ValueSchema = ValueSchema.Object(emptyMap()),
@@ -52,6 +64,7 @@ data class ProviderDescriptor(
         require(providerId.isNotBlank()) { "provider id must not be blank" }
         require(version > 0) { "provider version must be positive" }
         require(protocolFormatVersion > 0) { "provider protocol format version must be positive" }
+        require(implementationBinding.isNotBlank()) { "provider implementation binding must not be blank" }
     }
 
     val id: String get() = providerId
@@ -83,7 +96,9 @@ data class ProviderInvocationRequest(
 sealed interface ProviderLifecycleMessage {
     data class Emission(
         val value: Value,
-        val emissionId: String,
+        val emissionId: EmissionId,
+        val invocationId: InvocationId,
+        val attemptId: AttemptId,
         val correlationId: String? = null,
     ) : ProviderLifecycleMessage
 
@@ -106,6 +121,7 @@ data class RegisteredProvider(
 /** Explicit, exact-match registry. It deliberately has no global fallback. */
 class ProviderRegistry(
     private val supportedProtocolFormatVersions: Set<Int> = setOf(1),
+    private val supportedIrFormatVersions: Set<Int> = setOf(1),
 ) {
     private val registrations = linkedMapOf<ProviderKey, RegisteredProvider>()
 
@@ -113,6 +129,12 @@ class ProviderRegistry(
     fun register(descriptor: ProviderDescriptor, implementation: ProviderImplementation? = null): RegisteredProvider {
         require(descriptor.protocolFormatVersion in supportedProtocolFormatVersions) {
             "provider ${descriptor.providerId}@${descriptor.version} uses unsupported protocol format version ${descriptor.protocolFormatVersion}"
+        }
+        require(descriptor.compatibility.irFormatVersions.any(supportedIrFormatVersions::contains)) {
+            "provider ${descriptor.providerId}@${descriptor.version} is incompatible with supported IR format versions ${supportedIrFormatVersions.sorted()}"
+        }
+        require(implementation == null || descriptor.implementationBinding == "in-process") {
+            "provider ${descriptor.providerId}@${descriptor.version} cannot register an in-process implementation for binding '${descriptor.implementationBinding}'"
         }
         val key = ProviderKey(descriptor.providerId, descriptor.version)
         require(key !in registrations) { "provider ${key} is already registered" }
