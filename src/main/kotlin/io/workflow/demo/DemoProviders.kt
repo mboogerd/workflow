@@ -382,7 +382,7 @@ object DemoProviders {
         private val applied = ConcurrentHashMap<String, Value>()
 
         override fun invoke(request: io.workflow.provider.ProviderInvocationRequest): Iterable<ProviderLifecycleMessage> {
-            check(request.invocationId.value !in applied) { "duplicate fake publication" }
+            check(!applied.containsKey(request.invocationId.value)) { "duplicate fake publication" }
             val result = Value.ObjectValue(mapOf(
                 "architecture" to request.input,
                 "externalWrites" to Value.IntegerValue(BigInteger.ONE),
