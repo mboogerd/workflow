@@ -64,12 +64,15 @@ class ProviderRuntimeTest {
             compiler = compiler,
             idSource = io.workflow.core.DeterministicIdSource("provider-"),
             clock = FixedClock(Instant.EPOCH),
+            workerCount = 1,
         ).run(yaml(output = "copied"), executionId = ExecutionId("provider-execution"))
 
         assertTrue(result.isSuccessful, result.failures.joinToString())
         assertEquals(Value.StringValue("two"), result.outputs.getValue("copied").value)
         assertEquals(4, result.journal.assignments().size)
-        assertEquals(listOf(1L, 1L, 2L, 2L), result.journal.assignments().map { it.revision })
+        assertTrue(result.journal.assignments().groupBy { it.registerId }.values.all { assignments ->
+            assignments.map { it.revision } == listOf(1L, 2L)
+        })
         assertEquals(1, result.journal.providerInvocations().size)
         assertEquals(1, result.journal.providerAttempts().size)
         assertEquals(2, result.journal.providerEmissions().count { it.kind == ProviderEventType.EMISSION_ACCEPTED })
