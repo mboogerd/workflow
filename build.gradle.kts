@@ -22,7 +22,7 @@ kotlin { jvmToolchain(21) }
 tasks.test { useJUnitPlatform() }
 application { mainClass.set("io.workflow.ApplicationKt") }
 
-val conformance by tasks.registering(JavaExec::class) {
+tasks.register<JavaExec>("conformance") {
     group = "verification"
     description = "Runs the versioned Workflow v1 conformance corpus."
     classpath = sourceSets.main.get().runtimeClasspath
