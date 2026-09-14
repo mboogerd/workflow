@@ -126,6 +126,31 @@ class SqliteJournalStore @JvmOverloads constructor(
         closed.set(true)
     }
 
+    override fun validateCompatibility() = read { connection ->
+        val userVersion = connection.createStatement().use { statement ->
+            statement.executeQuery("PRAGMA user_version").use { result -> result.next(); result.getInt(1) }
+        }
+        require(userVersion == CURRENT_DATABASE_VERSION) {
+            "unsupported SQLite database format version $userVersion (current is $CURRENT_DATABASE_VERSION)"
+        }
+        val metadataVersion = connection.createStatement().use { statement ->
+            statement.executeQuery("SELECT format_version FROM database_metadata WHERE singleton = 1").use { result ->
+                if (result.next()) result.getInt(1) else CURRENT_DATABASE_VERSION
+            }
+        }
+        require(metadataVersion == CURRENT_DATABASE_VERSION) {
+            "unsupported SQLite metadata format version $metadataVersion (current is $CURRENT_DATABASE_VERSION)"
+        }
+        listOf("journal_batches", "assignments").forEach { table ->
+            val version = connection.createStatement().use { statement ->
+                statement.executeQuery("SELECT COALESCE(MAX(format_version), 1) FROM $table").use { result -> result.next(); result.getInt(1) }
+            }
+            require(version == CURRENT_DATABASE_VERSION) {
+                "unsupported $table format version $version (current is $CURRENT_DATABASE_VERSION)"
+            }
+        }
+    }
+
     private fun ensureOpen() {
         check(!closed.get()) { "SQLite journal store is closed" }
     }
@@ -373,6 +398,15 @@ class SqliteJournalStore @JvmOverloads constructor(
             )
             statement.executeUpdate(
                 """
+                CREATE TABLE IF NOT EXISTS ambiguous_activations(
+                    intent_id TEXT PRIMARY KEY REFERENCES activation_intents(id),
+                    detected_at TEXT NOT NULL,
+                    reason TEXT NOT NULL
+                )
+                """.trimIndent(),
+            )
+            statement.executeUpdate(
+                """
                 CREATE TABLE IF NOT EXISTS provider_events(
                     event_id TEXT PRIMARY KEY,
                     type TEXT NOT NULL,
@@ -545,6 +579,55 @@ class SqliteJournalStore @JvmOverloads constructor(
             statement.executeUpdate()
         }
         parameters
+    }
+
+    override fun executionBinding(executionId: ExecutionId): ExecutionBindingRecord? = read { connection ->
+        connection.prepareStatement(
+            "SELECT workflow_version_id, content_hash, parameters_json FROM executions WHERE execution_id = ?",
+        ).use { statement ->
+            statement.setString(1, executionId.value)
+            statement.executeQuery().use { result ->
+                if (!result.next()) null else ExecutionBindingRecord(
+                    executionId,
+                    WorkflowVersionId(result.getString(1)),
+                    result.getString(2),
+                    decodeValues(result.getString(3)),
+                )
+            }
+        }
+    }
+
+    override fun executionIds(): List<ExecutionId> = read { connection ->
+        connection.createStatement().use { statement ->
+            statement.executeQuery("SELECT execution_id FROM executions ORDER BY created_at, execution_id").use { result ->
+                buildList { while (result.next()) add(ExecutionId(result.getString(1))) }
+            }
+        }
+    }
+
+    override fun workflowDefinition(workflowId: WorkflowId, workflowVersionId: WorkflowVersionId): WorkflowDefinitionRecord? = read { connection ->
+        connection.prepareStatement(
+            "SELECT content_hash, content FROM workflow_definitions WHERE workflow_id = ? AND workflow_version_id = ?",
+        ).use { statement ->
+            statement.setString(1, workflowId.value)
+            statement.setString(2, workflowVersionId.value)
+            statement.executeQuery().use { result ->
+                if (!result.next()) null else WorkflowDefinitionRecord(workflowId, workflowVersionId, result.getString(1), result.getString(2))
+            }
+        }
+    }
+
+    override fun workflowDefinitionForVersion(workflowVersionId: WorkflowVersionId): WorkflowDefinitionRecord? = read { connection ->
+        connection.prepareStatement(
+            "SELECT workflow_id, content_hash, content FROM workflow_definitions WHERE workflow_version_id = ? ORDER BY created_at LIMIT 1",
+        ).use { statement ->
+            statement.setString(1, workflowVersionId.value)
+            statement.executeQuery().use { result ->
+                if (!result.next()) null else WorkflowDefinitionRecord(
+                    WorkflowId(result.getString(1)), workflowVersionId, result.getString(2), result.getString(3),
+                )
+            }
+        }
     }
 
     override fun commit(batch: JournalBatch, activationIntents: Collection<ActivationIntent>): JournalBatch = write { connection ->
@@ -844,6 +927,9 @@ class SqliteJournalStore @JvmOverloads constructor(
         connection.prepareStatement(
             "UPDATE activation_intents SET state = 'done', claimed_by = NULL, claimed_until = NULL, deferred_requirements_json = NULL WHERE id = ?",
         ).use { statement -> statement.setString(1, intentId.value); statement.executeUpdate() }
+        connection.prepareStatement("DELETE FROM ambiguous_activations WHERE intent_id = ?").use { statement ->
+            statement.setString(1, intentId.value); statement.executeUpdate()
+        }
         Unit
     }
 
@@ -865,6 +951,9 @@ class SqliteJournalStore @JvmOverloads constructor(
         connection.prepareStatement(
             "UPDATE activation_intents SET state = 'open', claimed_by = NULL, claimed_until = NULL, deferred_requirements_json = NULL WHERE id = ?",
         ).use { statement -> statement.setString(1, intentId.value); statement.executeUpdate() }
+        connection.prepareStatement("DELETE FROM ambiguous_activations WHERE intent_id = ?").use { statement ->
+            statement.setString(1, intentId.value); statement.executeUpdate()
+        }
         Unit
     }
 
@@ -876,6 +965,9 @@ class SqliteJournalStore @JvmOverloads constructor(
         connection.prepareStatement(
             "UPDATE activation_intents SET state = 'stopped', claimed_by = NULL, claimed_until = NULL, deferred_requirements_json = NULL WHERE id = ?",
         ).use { statement -> statement.setString(1, intentId.value); statement.executeUpdate() }
+        connection.prepareStatement("DELETE FROM ambiguous_activations WHERE intent_id = ?").use { statement ->
+            statement.setString(1, intentId.value); statement.executeUpdate()
+        }
         Unit
     }
 
@@ -917,7 +1009,38 @@ class SqliteJournalStore @JvmOverloads constructor(
         exists(connection, "SELECT 1 FROM activation_intents WHERE execution_id = ? AND state IN ('pending', 'claimed')", executionId.value)
     }
 
-    override fun isOpen(intentId: ActivationIntentId): Boolean = read { connection -> isState(connection, intentId, "open") }
+    override fun isOpen(intentId: ActivationIntentId): Boolean = read { connection ->
+        isState(connection, intentId, "open") && !exists(connection, "SELECT 1 FROM ambiguous_activations WHERE intent_id = ?", intentId.value)
+    }
+
+    override fun holdAmbiguousActivation(intentId: ActivationIntentId) = write { connection ->
+        require(exists(connection, "SELECT 1 FROM activation_intents WHERE id = ?", intentId.value)) {
+            "cannot hold an unknown activation intent"
+        }
+        require(!isState(connection, intentId, "done")) { "cannot hold a completed activation intent" }
+        connection.prepareStatement(
+            "UPDATE activation_intents SET state = 'open', claimed_by = NULL, claimed_until = NULL, deferred_requirements_json = NULL WHERE id = ?",
+        ).use { statement -> statement.setString(1, intentId.value); statement.executeUpdate() }
+        connection.prepareStatement(
+            "INSERT OR REPLACE INTO ambiguous_activations(intent_id, detected_at, reason) VALUES (?, ?, ?)",
+        ).use { statement ->
+            statement.setString(1, intentId.value)
+            statement.setString(2, clock.now().toString())
+            statement.setString(3, "provider attempt completed without terminal lifecycle record")
+            statement.executeUpdate()
+        }
+        Unit
+    }
+
+    override fun isAmbiguous(intentId: ActivationIntentId): Boolean = read { connection ->
+        exists(connection, "SELECT 1 FROM ambiguous_activations WHERE intent_id = ?", intentId.value)
+    }
+
+    override fun recoverActivationClaims(executionId: ExecutionId): Int = write { connection ->
+        connection.prepareStatement(
+            "UPDATE activation_intents SET state = 'pending', claimed_by = NULL, claimed_until = NULL WHERE execution_id = ? AND state = 'claimed'",
+        ).use { statement -> statement.setString(1, executionId.value); statement.executeUpdate() }
+    }
 
     override fun isStopped(intentId: ActivationIntentId): Boolean = read { connection -> isState(connection, intentId, "stopped") }
 
