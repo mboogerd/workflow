@@ -93,7 +93,7 @@ data class ActivationRecord(
     val discriminatorRevision: AssignmentId? = null,
     val branchTag: String? = null,
 ) {
-    enum class Status { COMPLETED, OPEN, FAILED, STOPPED }
+    enum class Status { COMPLETED, OPEN, FAILED, STOPPED, AMBIGUOUS }
 
     val parentMapActivationId: ActivationId? get() = mapActivationId
     val itemIdentity: String? get() = mapItemId
@@ -294,6 +294,22 @@ interface WorkflowJournalStore : JournalBatchCommitter, CurrentViewProjection, A
         contentHash: String,
         content: String? = null,
     ) {}
+
+    /** Durable deployment metadata used to reconstruct a process-local session. */
+    fun workflowDefinition(workflowId: WorkflowId, workflowVersionId: WorkflowVersionId): WorkflowDefinitionRecord? = null
+    fun workflowDefinitionForVersion(workflowVersionId: WorkflowVersionId): WorkflowDefinitionRecord? = null
+    fun executionBinding(executionId: ExecutionId): ExecutionBindingRecord? = null
+    fun executionIds(): List<ExecutionId> = emptyList()
+
+    /** Make claims left by a previous process eligible for restart classification. */
+    fun recoverActivationClaims(executionId: ExecutionId): Int = 0
+
+    /** Validate storage and record format markers before a restart/replay claim. */
+    fun validateCompatibility() {}
+
+    /** Hold an interrupted effect/agentic attempt until reconciliation exists. */
+    fun holdAmbiguousActivation(intentId: ActivationIntentId) {}
+    fun isAmbiguous(intentId: ActivationIntentId): Boolean = false
 }
 
 /**
@@ -314,6 +330,7 @@ class InMemoryJournalStore(
     private val openIntentIds = linkedSetOf<ActivationIntentId>()
     private val deferredIntentIds = linkedSetOf<ActivationIntentId>()
     private val deferredRequirements = linkedMapOf<ActivationIntentId, Set<RegisterKey>>()
+    private val ambiguousIntentIds = linkedSetOf<ActivationIntentId>()
     private val activationRecords = mutableListOf<ActivationRecord>()
     private val providerEvents = mutableListOf<ProviderLifecycleEvent>()
     private val providerEventIds = mutableSetOf<String>()
@@ -342,6 +359,14 @@ class InMemoryJournalStore(
         executionBindings.getValue(executionId).parameters
     }
 
+    override fun executionBinding(executionId: ExecutionId): ExecutionBindingRecord? = synchronized(lock) {
+        executionBindings[executionId]?.let { binding ->
+            ExecutionBindingRecord(executionId, binding.workflowVersionId, binding.contentHash, binding.parameters)
+        }
+    }
+
+    override fun executionIds(): List<ExecutionId> = synchronized(lock) { executionBindings.keys.toList() }
+
     override fun recordWorkflowDefinition(
         workflowId: WorkflowId,
         workflowVersionId: WorkflowVersionId,
@@ -351,10 +376,22 @@ class InMemoryJournalStore(
         val key = workflowId to workflowVersionId
         val proposed = WorkflowDefinitionRecord(workflowId, workflowVersionId, contentHash, content)
         val existing = workflowDefinitions[key]
-        require(existing == null || existing == proposed) {
-            "workflow version is already bound to different content"
+        if (existing != null) {
+            require(existing.contentHash == contentHash && (content == null || existing.content == null || existing.content == content)) {
+                "workflow version is already bound to different content"
+            }
+            if (existing.content == null && content != null) workflowDefinitions[key] = proposed
+        } else {
+            workflowDefinitions[key] = proposed
         }
-        workflowDefinitions[key] = proposed
+    }
+
+    override fun workflowDefinition(workflowId: WorkflowId, workflowVersionId: WorkflowVersionId): WorkflowDefinitionRecord? = synchronized(lock) {
+        workflowDefinitions[workflowId to workflowVersionId]
+    }
+
+    override fun workflowDefinitionForVersion(workflowVersionId: WorkflowVersionId): WorkflowDefinitionRecord? = synchronized(lock) {
+        workflowDefinitions.values.firstOrNull { it.workflowVersionId == workflowVersionId }
     }
 
     override fun commit(batch: JournalBatch, activationIntents: Collection<ActivationIntent>): JournalBatch =
@@ -512,6 +549,7 @@ class InMemoryJournalStore(
         deferredIntentIds -= intentId
         deferredRequirements.remove(intentId)
         stoppedIntentIds -= intentId
+        ambiguousIntentIds -= intentId
         completedIntentIds += intentId
     }
 
@@ -527,6 +565,7 @@ class InMemoryJournalStore(
         deferredIntentIds -= intentId
         deferredRequirements.remove(intentId)
         stoppedIntentIds += intentId
+        ambiguousIntentIds -= intentId
     }
 
     /** Stop every unfinished activation belonging to one hosted execution. */
@@ -555,6 +594,7 @@ class InMemoryJournalStore(
         require(intentId !in completedIntentIds) { "cannot reopen a completed activation intent" }
         claimedIntentIds -= intentId
         openIntentIds += intentId
+        ambiguousIntentIds -= intentId
     }
 
     /**
@@ -585,9 +625,22 @@ class InMemoryJournalStore(
                 it.id !in completedIntentIds &&
                 it.id !in stoppedIntentIds &&
                 it.id !in openIntentIds &&
-                it.id !in deferredIntentIds
+                it.id !in deferredIntentIds &&
+                it.id !in ambiguousIntentIds
         }
     }
+
+    override fun holdAmbiguousActivation(intentId: ActivationIntentId) = synchronized(lock) {
+        require(intentId in activationIntents) { "cannot hold an unknown activation intent" }
+        require(intentId !in completedIntentIds) { "cannot hold a completed activation intent" }
+        claimedIntentIds -= intentId
+        openIntentIds -= intentId
+        deferredIntentIds -= intentId
+        deferredRequirements.remove(intentId)
+        ambiguousIntentIds += intentId
+    }
+
+    override fun isAmbiguous(intentId: ActivationIntentId): Boolean = synchronized(lock) { intentId in ambiguousIntentIds }
 
     override fun isOpen(intentId: ActivationIntentId): Boolean = synchronized(lock) { intentId in openIntentIds }
 
@@ -839,6 +892,13 @@ data class WorkflowDefinitionRecord(
     val content: String? = null,
 )
 
+data class ExecutionBindingRecord(
+    val executionId: ExecutionId,
+    val workflowVersionId: WorkflowVersionId,
+    val contentHash: String,
+    val parameters: Map<String, Value>,
+)
+
 private class BindingFailure(message: String) : IllegalArgumentException(message)
 
 private sealed interface Evaluated {
@@ -996,10 +1056,12 @@ class InMemoryWorkflowRunner(
         beforeActivation: (ActivationIntent) -> Unit = {},
     ): HostedWorkflowExecution {
         validateParameters(workflow, parameters)
+        val existingBinding = journal.executionBinding(executionId)
         journal.recordWorkflowDefinition(
             WorkflowId(workflow.workflowId),
             workflow.workflowVersionId,
             workflow.contentHash,
+            workflow.canonicalJson(),
         )
         val boundParameters = journal.bindExecution(
             executionId,
@@ -1028,8 +1090,162 @@ class InMemoryWorkflowRunner(
         journal.wakeDeferredActivations(executionId)
 
         val hosted = HostedWorkflowExecution(this, executionId)
+        if (existingBinding != null) prepareForResume(session)
         runUntilQuiescent(session)
         return hosted
+    }
+
+    /** Reconstruct and resume an execution persisted by a previous process. */
+    fun resume(
+        workflow: WorkflowIrDocument,
+        executionId: ExecutionId,
+        beforeActivation: (ActivationIntent) -> Unit = {},
+    ): HostedWorkflowExecution {
+        require(workflow.irVersion == 1) { "unsupported workflow IR version ${workflow.irVersion}" }
+        require(workflow.hasValidContentHash()) { "workflow IR content hash does not match canonical content" }
+        val binding = journal.executionBinding(executionId)
+            ?: throw WorkflowExecutionException("execution '${executionId.value}' is not persisted")
+        require(binding.workflowVersionId == workflow.workflowVersionId && binding.contentHash == workflow.contentHash) {
+            "execution '${executionId.value}' is bound to incompatible workflow content"
+        }
+        return start(workflow, binding.parameters, executionId, beforeActivation)
+    }
+
+    /** Reconstruct an execution using the deployed canonical IR stored in SQLite. */
+    fun resume(
+        executionId: ExecutionId,
+        beforeActivation: (ActivationIntent) -> Unit = {},
+    ): HostedWorkflowExecution {
+        val binding = journal.executionBinding(executionId)
+            ?: throw WorkflowExecutionException("execution '${executionId.value}' is not persisted")
+        val definition = journal.workflowDefinitionForVersion(binding.workflowVersionId)
+            ?: throw WorkflowExecutionException("workflow IR for '${binding.workflowVersionId.value}' is not persisted")
+        val content = definition.content
+            ?: throw WorkflowExecutionException("workflow IR for '${binding.workflowVersionId.value}' has no persisted content")
+        val workflow = try { io.workflow.compiler.WorkflowIrCodec.decode(content) } catch (failure: IllegalArgumentException) {
+            throw WorkflowExecutionException("persisted workflow IR is incompatible: ${failure.message}")
+        }
+        require(definition.contentHash == binding.contentHash && workflow.contentHash == binding.contentHash) {
+            "persisted workflow content hash is incompatible with execution"
+        }
+        return resume(workflow, executionId, beforeActivation)
+    }
+
+    /**
+     * Reclassify durable work before any new claim is made. Terminal lifecycle
+     * records are authoritative; an attempt without one is replayable only for
+     * pure/read providers. Effectful and agentic attempts are held ambiguous.
+     */
+    private fun prepareForResume(session: ExecutionSession) {
+        val workflow = session.workflow
+        require(workflow.irVersion == 1) { "unsupported workflow IR version ${workflow.irVersion}" }
+        require(workflow.hasValidContentHash()) { "workflow IR content hash does not match canonical content" }
+        journal.validateCompatibility()
+        validateProviderCompatibility(workflow)
+        journal.recoverActivationClaims(session.executionId)
+
+        val intents = journal.activationIntents().filter { it.executionId == session.executionId }
+        val events = journal.providerEvents().filter { it.executionId == session.executionId }
+        intents.forEach { intent ->
+            if (journal.isCompleted(intent.id) || journal.isStopped(intent.id) || journal.isAmbiguous(intent.id)) return@forEach
+            val lifecycle = events.filter { it.intentId == intent.id }
+            val latestAttemptIndex = lifecycle.indexOfLast { it.type == ProviderEventType.ATTEMPT_STARTED }
+            val terminal = lifecycle.drop((latestAttemptIndex + 1).coerceAtLeast(0)).lastOrNull {
+                it.type == ProviderEventType.COMPLETED || it.type == ProviderEventType.OPEN || it.type == ProviderEventType.FAILED
+            }
+            when (terminal?.type) {
+                ProviderEventType.COMPLETED -> {
+                    val attempt = lifecycle.lastOrNull { it.type == ProviderEventType.ATTEMPT_STARTED }
+                    recordActivation(intent, ActivationRecord.Status.COMPLETED, attempt?.occurredAt ?: terminal.occurredAt, null, terminal.invocationId, attempt?.attemptId)
+                    journal.completeActivation(intent.id)
+                }
+                ProviderEventType.FAILED -> {
+                    val attempt = lifecycle.lastOrNull { it.type == ProviderEventType.ATTEMPT_STARTED }
+                    recordActivation(intent, ActivationRecord.Status.FAILED, attempt?.occurredAt ?: terminal.occurredAt, terminal.diagnostic, terminal.invocationId, attempt?.attemptId)
+                    journal.completeActivation(intent.id)
+                }
+                ProviderEventType.OPEN -> {
+                    if (!journal.isOpen(intent.id)) journal.keepActivationOpen(intent.id)
+                }
+                null -> {
+                    val attempt = lifecycle.lastOrNull { it.type == ProviderEventType.ATTEMPT_STARTED }
+                    if (attempt != null && providerEffectClass(workflow, intent) in setOf(
+                            io.workflow.provider.EffectClass.EFFECT,
+                            io.workflow.provider.EffectClass.AGENTIC,
+                        )) {
+                        journal.holdAmbiguousActivation(intent.id)
+                        recordActivation(
+                            intent,
+                            ActivationRecord.Status.AMBIGUOUS,
+                            attempt.occurredAt,
+                            "AMBIGUOUS_ATTEMPT: provider attempt has no terminal lifecycle record",
+                            attempt.invocationId,
+                            attempt.attemptId,
+                        )
+                    }
+                }
+                else -> Unit
+            }
+        }
+        reconstructOpenProviders(session, intents, events)
+    }
+
+    private fun validateProviderCompatibility(workflow: WorkflowIrDocument) {
+        fun visit(register: CompiledRegister) {
+            register.provider?.let { binding ->
+                val registration = providerRegistry.resolve(binding.providerId, binding.version)
+                    ?: throw WorkflowExecutionException("provider ${binding.providerId}@${binding.version} is unavailable for resume")
+                require(registration.descriptor.protocolFormatVersion == 1) {
+                    "provider ${binding.providerId}@${binding.version} uses unsupported protocol format version"
+                }
+            }
+            when (val producer = register.compiledProducer) {
+                is CompiledProducer.Match -> producer.value.cases.values.forEach { visit(it.asRegister(register)) }
+                is CompiledProducer.Map -> producer.value.context.forEach(::visit)
+                else -> Unit
+            }
+        }
+        workflow.registers.forEach(::visit)
+    }
+
+    private fun providerEffectClass(workflow: WorkflowIrDocument, intent: ActivationIntent): io.workflow.provider.EffectClass {
+        val register = resolveProducer(workflow, intent.producerId)
+        val binding = register?.provider ?: return io.workflow.provider.EffectClass.PURE
+        return providerRegistry.resolve(binding.providerId, binding.version)?.descriptor?.effectClass
+            ?: io.workflow.provider.EffectClass.EFFECT
+    }
+
+    private fun reconstructOpenProviders(
+        session: ExecutionSession,
+        intents: List<ActivationIntent>,
+        events: List<ProviderLifecycleEvent>,
+    ) {
+        val byIntent = intents.associateBy { it.id }
+        events.filter { it.type == ProviderEventType.OPEN }.forEach { open ->
+            val intent = byIntent[open.intentId] ?: return@forEach
+            if (journal.isAmbiguous(intent.id) || !journal.isOpen(intent.id)) return@forEach
+            val register = resolveProducer(session.workflow, intent.producerId) ?: return@forEach
+            val attempt = events.lastOrNull { it.intentId == intent.id && it.type == ProviderEventType.ATTEMPT_STARTED }
+                ?: return@forEach
+            val terminalAfter = events.any {
+                it.intentId == intent.id && it.occurredAt >= open.occurredAt &&
+                    it.type in setOf(ProviderEventType.COMPLETED, ProviderEventType.FAILED)
+            }
+            if (terminalAfter) return@forEach
+            session.openProviders.putIfAbsent(
+                open.invocationId,
+                OpenProviderState(
+                    workflow = session.workflow,
+                    intent = intent,
+                    register = register,
+                    invocationId = open.invocationId,
+                    attemptId = attempt.attemptId ?: return@forEach,
+                    startedAt = journal.activations().firstOrNull { it.intentId == intent.id }?.startedAt ?: attempt.occurredAt,
+                    seenEmissionIds = events.filter { it.intentId == intent.id && it.emissionId != null }
+                        .mapNotNull { it.emissionId }.toMutableSet(),
+                ),
+            )
+        }
     }
 
     fun host(

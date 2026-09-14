@@ -4,6 +4,9 @@ import io.workflow.core.CanonicalValueJson
 import io.workflow.core.Value
 import io.workflow.compiler.WorkflowCompiler
 import io.workflow.runtime.InMemoryWorkflowRunner
+import io.workflow.runtime.SqliteJournalStore
+import io.workflow.runtime.WorkflowReplay
+import io.workflow.core.ExecutionId
 import io.workflow.runtime.WorkflowExecutionException
 import io.workflow.demo.DemoProviders
 import java.nio.file.Files
@@ -11,7 +14,7 @@ import java.nio.file.Path
 
 fun main(args: Array<String>) {
     if (args.isEmpty() || args.first() == "--help") {
-        println("No command was given. Use validate, compile, run, inspect, or stop. Add --stop to administratively stop a hosted run.")
+        println("No command was given. Use validate, compile, run, inspect, stop, resume, or replay.")
         return
     }
     when (args.first()) {
@@ -42,10 +45,79 @@ fun main(args: Array<String>) {
             inspectionOnly = args.first() == "inspect" || args.first() == "stop",
             administrativeStop = args.first() == "stop",
         )
+        "resume" -> resumeDatabase(args)
+        "replay" -> replayDatabase(args)
         else -> {
-            System.err.println("unknown command '${args.first()}'; use validate, compile, run, inspect, or stop")
+            System.err.println("unknown command '${args.first()}'; use validate, compile, run, inspect, stop, resume, or replay")
             kotlin.system.exitProcess(2)
         }
+    }
+}
+
+private fun resumeDatabase(args: Array<String>) {
+    val database = databasePath(args, "resume") ?: return
+    val providers = providerRegistry(args)
+    val selected = selectedExecution(args)
+    try {
+        SqliteJournalStore(database).use { store ->
+            val ids = selected?.let(::listOf) ?: store.executionIds()
+            require(ids.isNotEmpty()) { "database contains no executions" }
+            val runner = InMemoryWorkflowRunner(
+                compiler = WorkflowCompiler(providerRegistry = providers),
+                journal = store,
+                providerRegistry = providers,
+            )
+            val results = ids.map { runner.resume(it).result() }
+            println("{\"mode\":\"resume\",\"executions\":[${results.joinToString(",") { result ->
+                "{\"executionId\":\"${result.executionId.value}\",\"state\":\"${result.executionState.name.lowercase()}\",\"successful\":${result.isSuccessful},\"outputs\":${result.outputsJson()}}"
+            }}]}")
+        }
+    } catch (failure: Exception) {
+        System.err.println("workflow resume failed: ${failure.message ?: "resume error"}")
+        kotlin.system.exitProcess(1)
+    }
+}
+
+private fun replayDatabase(args: Array<String>) {
+    val database = databasePath(args, "replay") ?: return
+    val selected = selectedExecution(args)
+    try {
+        SqliteJournalStore(database).use { store ->
+            val ids = selected?.let(::listOf) ?: store.executionIds()
+            require(ids.isNotEmpty()) { "database contains no executions" }
+            val summaries = ids.map { id ->
+                val binding = store.executionBinding(id)
+                val workflow = binding?.let { bound ->
+                    store.workflowDefinitionForVersion(bound.workflowVersionId)?.content?.let { io.workflow.compiler.WorkflowIrCodec.decode(it) }
+                }
+                WorkflowReplay.replay(store, id, workflow).single().outputsJson(workflow)
+            }
+            println("{\"mode\":\"replay\",\"executions\":[${summaries.joinToString(",")}]}" )
+        }
+    } catch (failure: Exception) {
+        System.err.println("workflow replay failed: ${failure.message ?: "replay error"}")
+        kotlin.system.exitProcess(1)
+    }
+}
+
+private fun databasePath(args: Array<String>, command: String): Path? {
+    if (args.size < 2) {
+        System.err.println("$command requires a database path")
+        kotlin.system.exitProcess(2)
+    }
+    val path = Path.of(args[1])
+    if (!Files.isRegularFile(path)) {
+        System.err.println("database file not found: $path")
+        kotlin.system.exitProcess(2)
+    }
+    return path
+}
+
+private fun selectedExecution(args: Array<String>): ExecutionId? {
+    val index = args.indexOf("--execution")
+    return if (index < 0) null else {
+        require(index + 1 < args.size) { "--execution requires an execution id" }
+        ExecutionId(args[index + 1])
     }
 }
 

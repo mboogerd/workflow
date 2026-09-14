@@ -184,6 +184,11 @@ data class WorkflowIrDocument(
     val irVersion: Int = 1,
 ) {
     fun canonicalJson(): String = CanonicalIrJson.document(this, includeHash = true, includeSource = false)
+
+    /** Hash of the canonical deployed IR excluding its self-referential hash. */
+    fun computedContentHash(): String = sha256(CanonicalIrJson.document(this, includeHash = false, includeSource = false))
+
+    fun hasValidContentHash(): Boolean = contentHash == computedContentHash()
 }
 
 private data class NodeInfo(val node: YamlNode, val path: String) {
