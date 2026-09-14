@@ -17,6 +17,10 @@ import io.workflow.core.Value
 import io.workflow.core.ValueSchema
 import io.workflow.core.WorkflowVersionId
 import io.workflow.core.isCompatibleWith
+import io.workflow.core.validate
+import io.workflow.provider.ProviderDescriptor
+import io.workflow.provider.ProviderKey
+import io.workflow.provider.ProviderRegistry
 import java.math.BigDecimal
 import java.math.BigInteger
 import java.security.MessageDigest
@@ -71,7 +75,20 @@ data class CompiledRegister(
     val dependencies: List<String>,
     val schema: ValueSchema,
     val source: SourceLocation,
+    /** Present only for a provider producer; ordinary expressions remain unchanged. */
+    val provider: CompiledProvider? = null,
 )
+
+data class CompiledProvider(
+    val providerId: String,
+    val version: Int,
+    val config: Value,
+    val input: Expression,
+    val capabilities: Set<String> = emptySet(),
+    val policy: Value = Value.ObjectValue(emptyMap()),
+) {
+    val providerVersion: Int get() = version
+}
 
 data class WorkflowIrDocument(
     val workflowId: String,
@@ -95,7 +112,10 @@ class WorkflowCompiler(
     private val maxDocumentCodePoints: Int = 1_000_000,
     private val maxNesting: Int = 64,
     private val maxAliases: Int = 32,
+    private val providerRegistry: ProviderRegistry = ProviderRegistry(),
 ) {
+    constructor(providerRegistry: ProviderRegistry) : this(1_000_000, 64, 32, providerRegistry)
+
     private var activeYamlLines: List<String> = emptyList()
 
     init {
@@ -149,6 +169,7 @@ class WorkflowCompiler(
         if (context == null || id == null || version == null) return CompilationResult(null, diagnostics)
 
         val definitions = linkedMapOf<String, Pair<YamlNode, Expression>>()
+        val providerDefinitions = linkedMapOf<String, CompiledProvider>()
         context.entries.forEach { (key, node) ->
             val name = key.content
             val path = "$.workflow.context.$name"
@@ -158,11 +179,13 @@ class WorkflowCompiler(
             if (name in RESERVED_ROOTS) diagnostics += Diagnostic("register name '$name' is reserved", path, key.location.source())
             if (name in definitions) diagnostics += Diagnostic("duplicate register definition '$name'", path, key.location.source())
             val producerFields = (node as? YamlMap)?.entries?.keys?.map { it.content }.orEmpty()
-            producerFields.firstOrNull { it == "provider" || it == "match" || it == "map" }?.let {
-                diagnostics += Diagnostic("producer form '$it' is not supported by the expression-only compiler", "$path.$it", node.location.source())
+            val provider = if ("provider" in producerFields) parseProvider(node, path, diagnostics) else null
+            producerFields.firstOrNull { it == "match" || it == "map" }?.let {
+                diagnostics += Diagnostic("producer form '$it' is not supported by this compiler", "$path.$it", node.location.source())
             }
-            val expr = parseExpression(node, path, diagnostics)
+            val expr = if (provider != null) provider.input else parseExpression(node, path, diagnostics)
             if (expr != null && name !in definitions) definitions[name] = node to expr
+            if (provider != null && name !in providerDefinitions) providerDefinitions[name] = provider
         }
         val schemaExplicit = mutableMapOf<String, ValueSchema>()
         val registers = mutableListOf<CompiledRegister>()
@@ -184,7 +207,9 @@ class WorkflowCompiler(
         definitions.forEach { (name, pair) ->
             val explicit = parseEmbeddedSchema(pair.first, "$.workflow.context.$name.schema", diagnostics)
             if (explicit != null) schemaExplicit[name] = explicit
-            val inferredSchema = inferRegister(name)
+            val inferredSchema = providerDefinitions[name]?.let { provider ->
+                providerRegistry.resolve(provider.providerId, provider.version)?.descriptor?.emissionSchema
+            } ?: inferRegister(name)
             val schema = explicit ?: inferredSchema
             if (explicit != null && !inferredSchema.isCompatibleWith(explicit)) {
                 diagnostics += Diagnostic("expression schema ${schemaName(inferredSchema)} is incompatible with declared ${schemaName(explicit)}", "$.workflow.context.$name.schema", pair.first.location.source())
@@ -198,7 +223,28 @@ class WorkflowCompiler(
                 dependencies = depsByName[name].orEmpty(),
                 schema = schema,
                 source = pair.first.location.source(),
+                provider = providerDefinitions[name],
             )
+        }
+        providerDefinitions.forEach { (name, provider) ->
+            val descriptor = providerRegistry.resolve(provider.providerId, provider.version)?.descriptor ?: return@forEach
+            val inputSchema = inferExpression(
+                provider.input,
+                parameters,
+                inferred,
+                definitions.keys,
+                emptySet(),
+                diagnostics,
+                "$.workflow.context.$name.with",
+                definitions.getValue(name).first.location.source(),
+            )
+            if (!inputSchema.isCompatibleWith(descriptor.inputSchema)) {
+                diagnostics += Diagnostic(
+                    "bound input schema ${schemaName(inputSchema)} is incompatible with provider input ${schemaName(descriptor.inputSchema)}",
+                    "$.workflow.context.$name.with",
+                    definitions.getValue(name).first.location.source(),
+                )
+            }
         }
         outputs.forEachIndexed { index, output ->
             if (output !in definitions) diagnostics += Diagnostic("output '$output' is unreachable because no such register is defined", "$.workflow.outputs[$index]", location(workflow, "outputs"))
@@ -242,6 +288,118 @@ class WorkflowCompiler(
             diagnostics += Diagnostic("duplicate output '$it'", "$.workflow.outputs", node.location.source())
         }
         return outputs
+    }
+
+    private fun parseProvider(node: YamlNode, path: String, diagnostics: MutableList<Diagnostic>): CompiledProvider? {
+        val map = node as? YamlMap ?: run {
+            diagnostics += Diagnostic("provider producer must be a mapping", path, node.location.source())
+            return null
+        }
+        checkFields(map, setOf("provider", "version", "config", "with", "schema", "policy", "capabilities"), path, diagnostics)
+        val providerId = (map.get("provider") as? YamlScalar)?.content?.takeIf { it.isNotBlank() }
+        if (providerId == null) {
+            diagnostics += Diagnostic("provider producer form is not supported: provider must be a non-empty string", "$path.provider", location(map, "provider"))
+            return null
+        }
+        val version = (map.get("version") as? YamlScalar)?.let(::scalarValue) as? Value.IntegerValue
+        val providerVersion = version?.value?.toIntExactOrNull()
+        if (providerVersion == null) {
+            diagnostics += Diagnostic("provider producer form is not supported: provider version must be an integer", "$path.version", location(map, "version"))
+            return null
+        }
+        val registration = providerRegistry.resolve(providerId, providerVersion)
+        if (registration == null) {
+            diagnostics += Diagnostic("unknown provider '${ProviderKey(providerId, providerVersion)}'; provider producer forms are not supported without a registered descriptor", path, node.location.source())
+            return null
+        }
+        val descriptor = registration.descriptor
+        if (descriptor.protocolFormatVersion != 1) {
+            diagnostics += Diagnostic("provider '${ProviderKey(providerId, providerVersion)}' uses unsupported protocol format version ${descriptor.protocolFormatVersion}", path, node.location.source())
+        }
+
+        val configNode = map.get<YamlNode>("config")
+        val config = configNode?.let { rawValue(it) } ?: Value.ObjectValue(emptyMap())
+        if (configNode != null) {
+            staticConfigReferences(configNode, "$path.config", descriptor, diagnostics)
+        }
+        val configValidation = descriptor.configurationSchema.validate(config)
+        configValidation.errors.forEach { error ->
+            diagnostics += Diagnostic("configuration ${error.message}", "$path.config${error.path.removePrefix("$")}", configNode?.location?.source() ?: node.location.source())
+        }
+
+        val withNode = map.get<YamlNode>("with")
+        val input = withNode?.let { parseExpression(it, "$path.with", diagnostics) } ?: Expression.Literal(Value.Null)
+        if (!containsReference(input)) {
+            val inputSchema = inferExpression(input, emptyMap(), emptyMap(), emptySet(), emptySet(), diagnostics, "$path.with", withNode?.location?.source() ?: node.location.source())
+            if (!inputSchema.isCompatibleWith(descriptor.inputSchema)) {
+                diagnostics += Diagnostic("bound input schema ${schemaName(inputSchema)} is incompatible with provider input ${schemaName(descriptor.inputSchema)}", "$path.with", withNode?.location?.source() ?: node.location.source())
+            }
+        }
+
+        val requestedCapabilities: List<String> = when (val capabilitiesNode = map.get<YamlNode>("capabilities")) {
+            null -> emptyList()
+            is YamlList -> capabilitiesNode.items.mapNotNull { item ->
+                (item as? YamlScalar)?.content ?: run {
+                    diagnostics += Diagnostic("capability must be a string", "$path.capabilities", item.location.source()); null
+                }
+            }
+            else -> {
+                diagnostics += Diagnostic("capabilities must be a list", "$path.capabilities", capabilitiesNode.location.source())
+                emptyList()
+            }
+        }
+        requestedCapabilities.filterNot(descriptor.capabilities::contains).forEach { capability ->
+            diagnostics += Diagnostic("provider capability '$capability' is not declared by descriptor", "$path.capabilities", location(map, "capabilities"))
+        }
+        val policy = map.get<YamlNode>("policy")?.let(::rawValue) ?: Value.ObjectValue(emptyMap())
+        descriptor.policySchema.validate(policy).errors.forEach { error ->
+            diagnostics += Diagnostic("policy ${error.message}", "$path.policy${error.path.removePrefix("$")}", map.get<YamlNode>("policy")?.location?.source() ?: node.location.source())
+        }
+        return CompiledProvider(providerId, providerVersion, config, input, requestedCapabilities.toSet(), policy)
+    }
+
+    private fun containsReference(expression: Expression): Boolean = when (expression) {
+        is Expression.Ref -> true
+        is Expression.ObjectValue -> expression.fields.values.any(::containsReference)
+        is Expression.ArrayValue -> expression.items.any(::containsReference)
+        is Expression.Concat -> expression.parts.any(::containsReference)
+        is Expression.Equals -> containsReference(expression.left) || containsReference(expression.right)
+        is Expression.Present -> containsReference(expression.value)
+        is Expression.And -> expression.predicates.any(::containsReference)
+        is Expression.Or -> expression.predicates.any(::containsReference)
+        is Expression.Not -> containsReference(expression.predicate)
+        is Expression.Literal -> false
+    }
+
+    private fun staticConfigReferences(node: YamlNode, path: String, descriptor: ProviderDescriptor, diagnostics: MutableList<Diagnostic>) {
+        staticConfigReferences(node, path, descriptor, diagnostics, null)
+    }
+
+    private fun staticConfigReferences(node: YamlNode, path: String, descriptor: ProviderDescriptor, diagnostics: MutableList<Diagnostic>, configField: String?) {
+        if (node is YamlMap) {
+            node.entries.forEach { (key, value) ->
+                val field = key.content
+                if (field.startsWith("$")) {
+                    val ref = (value as? YamlScalar)?.content
+                    if (field == "\$ref" || field == "\$optional") {
+                        val root = ref?.let(::referenceRoot)
+                        if (root != null && root != "parameters" && (configField == null || descriptor.isDeploymentStatic(configField))) {
+                            diagnostics += Diagnostic("deployment-static configuration cannot reference context '$root'", "$path.$field", value.location.source())
+                        }
+                    }
+                }
+                staticConfigReferences(value, "$path.$field", descriptor, diagnostics, configField ?: field.takeUnless { it.startsWith("$") })
+            }
+        } else if (node is YamlList) node.items.forEachIndexed { index, child -> staticConfigReferences(child, "$path[$index]", descriptor, diagnostics, configField) }
+    }
+
+    private fun referenceRoot(text: String): String? {
+        val body = text.removePrefix("$")
+        return when {
+            body.startsWith(".") -> body.substring(1).takeWhile { it.isLetterOrDigit() || it == '_' || it == '-' }.takeIf { it.isNotEmpty() }
+            body.startsWith("['") || body.startsWith("[\"") -> body.substring(2).takeWhile { it != '\'' && it != '"' }.takeIf { it.isNotEmpty() }
+            else -> null
+        }
     }
 
     private fun parseExpression(node: YamlNode, path: String, diagnostics: MutableList<Diagnostic>): Expression? {
@@ -373,7 +531,7 @@ class WorkflowCompiler(
 
     private fun parseEmbeddedSchema(node: YamlNode, path: String, diagnostics: MutableList<Diagnostic>): ValueSchema? {
         val map = node as? YamlMap ?: return null
-        if (map.entries.keys.none { it.content.startsWith("$") }) return null
+        if (map.entries.keys.none { it.content.startsWith("$") || it.content in setOf("provider", "match", "map") }) return null
         val schemaNode: YamlNode? = map.get<YamlNode>("schema")
         return schemaNode?.let { parseSchema(it, path, diagnostics) }
     }
@@ -659,15 +817,28 @@ private object CanonicalIrJson {
         if (includeHash) fields["contentHash"] = JsonPrimitive(doc.contentHash)
         return JsonObject(fields.toSortedMap()).toString()
     }
-    private fun register(register: CompiledRegister, includeSource: Boolean): JsonElement = JsonObject(linkedMapOf(
-        "name" to JsonPrimitive(register.name),
-        "registerId" to JsonPrimitive(register.registerId.value),
-        "producerId" to JsonPrimitive(register.producerId.value),
-        "dependencies" to JsonArray(register.dependencies.sorted().map(::JsonPrimitive)),
-        "schema" to schema(register.schema),
-        "producer" to expression(register.producer),
-        *(if (includeSource) arrayOf("source" to JsonObject(mapOf("line" to JsonPrimitive(register.source.line), "column" to JsonPrimitive(register.source.column)))) else emptyArray()),
-    ).toSortedMap())
+    private fun register(register: CompiledRegister, includeSource: Boolean): JsonElement {
+        val fields = linkedMapOf<String, JsonElement>(
+            "name" to JsonPrimitive(register.name),
+            "registerId" to JsonPrimitive(register.registerId.value),
+            "producerId" to JsonPrimitive(register.producerId.value),
+            "dependencies" to JsonArray(register.dependencies.sorted().map(::JsonPrimitive)),
+            "schema" to schema(register.schema),
+            "producer" to expression(register.producer),
+        )
+        register.provider?.let { provider ->
+            fields["provider"] = JsonObject(linkedMapOf(
+                "providerId" to JsonPrimitive(provider.providerId),
+                "version" to JsonPrimitive(provider.version),
+                "config" to jsonValue(provider.config),
+                "input" to expression(provider.input),
+                "capabilities" to JsonArray(provider.capabilities.sorted().map(::JsonPrimitive)),
+                "policy" to jsonValue(provider.policy),
+            ))
+        }
+        if (includeSource) fields["source"] = JsonObject(mapOf("line" to JsonPrimitive(register.source.line), "column" to JsonPrimitive(register.source.column)))
+        return JsonObject(fields.toSortedMap())
+    }
     private fun expression(expression: Expression): JsonElement = when (expression) {
         is Expression.Literal -> JsonObject(mapOf("kind" to JsonPrimitive("literal"), "value" to jsonValue(expression.value)))
         is Expression.Ref -> JsonObject(mapOf(
