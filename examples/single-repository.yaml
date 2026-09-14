@@ -1,0 +1,22 @@
+workflow:
+  id: single-repository
+  version: 1
+  parameters:
+    repository: {schema: string}
+    commit: {schema: string}
+  context:
+    snapshot:
+      provider: demo.repository-reader
+      version: 1
+      with:
+        repository: {$ref: "$.parameters.repository"}
+        commit: {$ref: "$.parameters.commit"}
+    model:
+      provider: demo.model-builder
+      version: 1
+      with: {$ref: "$.snapshot"}
+    summary:
+      $concat:
+        - "Repository model: "
+        - {$ref: "$.model.summary"}
+  outputs: [model, summary]

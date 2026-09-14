@@ -5,6 +5,7 @@ import io.workflow.core.Value
 import io.workflow.compiler.WorkflowCompiler
 import io.workflow.runtime.InMemoryWorkflowRunner
 import io.workflow.runtime.WorkflowExecutionException
+import io.workflow.demo.DemoProviders
 import java.nio.file.Files
 import java.nio.file.Path
 
@@ -67,6 +68,18 @@ private fun runFile(args: Array<String>, inspectionOnly: Boolean) {
         System.err.println("YAML file not found: $yamlPath")
         kotlin.system.exitProcess(2)
     }
+    val providerIndex = args.indexOf("--providers")
+    val providers = if (providerIndex >= 0 && providerIndex + 1 < args.size) {
+        when (args[providerIndex + 1]) {
+            "demo" -> DemoProviders.registry()
+            else -> {
+                System.err.println("unknown provider profile '${args[providerIndex + 1]}'")
+                kotlin.system.exitProcess(2)
+            }
+        }
+    } else {
+        io.workflow.provider.ProviderRegistry.empty()
+    }
     val parameterIndex = args.indexOf("--parameters")
     if (parameterIndex < 0 || parameterIndex + 1 >= args.size) {
         System.err.println("${args.first()} requires --parameters <json>")
@@ -84,14 +97,14 @@ private fun runFile(args: Array<String>, inspectionOnly: Boolean) {
         System.err.println("invalid parameters JSON: ${failure.message ?: "parse error"}")
         kotlin.system.exitProcess(1)
     }
-    val compiler = WorkflowCompiler()
+    val compiler = WorkflowCompiler(providerRegistry = providers)
     val compilation = compiler.compile(Files.readString(yamlPath))
     if (!compilation.isValid) {
         compilation.diagnostics.forEach { System.err.println(it) }
         kotlin.system.exitProcess(1)
     }
     val result = try {
-        InMemoryWorkflowRunner(compiler = compiler).execute(compilation.ir!!, parameters)
+        InMemoryWorkflowRunner(compiler = compiler, providerRegistry = providers).execute(compilation.ir!!, parameters)
     } catch (failure: Exception) {
         System.err.println("workflow execution failed: ${failure.message ?: "execution error"}")
         kotlin.system.exitProcess(1)
