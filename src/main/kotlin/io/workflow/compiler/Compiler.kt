@@ -804,8 +804,31 @@ class WorkflowCompiler(
         }
         try {
             val executionPolicy = ProviderExecutionPolicy.from(policy)
+            if (descriptor.effectClass !in setOf(EffectClass.PURE, EffectClass.READ) && descriptor.idempotency == null) {
+                diagnostics += Diagnostic(
+                    "${descriptor.effectClass.name.lowercase()} provider descriptor must declare idempotent-by-key, reconcile-by-key, or unsafe-ambiguous behavior",
+                    path,
+                    node.location.source(),
+                )
+            }
+            if (descriptor.idempotency?.mode == io.workflow.provider.ReconciliationMode.QUERY_BY_INVOCATION &&
+                registration.implementation !is io.workflow.provider.ReconciliationProviderImplementation) {
+                diagnostics += Diagnostic(
+                    "reconcile-by-key provider descriptor requires a reconciliation implementation",
+                    path,
+                    node.location.source(),
+                )
+            }
             if (executionPolicy.maximumAttempts > 1 && descriptor.effectClass !in setOf(EffectClass.PURE, EffectClass.READ)) {
-                diagnostics += Diagnostic("retry policy is unsafe for ${descriptor.effectClass.name.lowercase()} providers; reconciliation is required", "$path.policy", map.get<YamlNode>("policy")?.location?.source() ?: node.location.source())
+                when (descriptor.idempotency?.mode) {
+                    io.workflow.provider.ReconciliationMode.IDEMPOTENT_BY_INVOCATION,
+                    io.workflow.provider.ReconciliationMode.QUERY_BY_INVOCATION -> Unit
+                    else -> diagnostics += Diagnostic(
+                        "retry policy is unsafe for ${descriptor.effectClass.name.lowercase()} providers; reconciliation is required unless idempotent-by-key or reconcile-by-key support is declared",
+                        "$path.policy",
+                        map.get<YamlNode>("policy")?.location?.source() ?: node.location.source(),
+                    )
+                }
             }
             if (executionPolicy.attemptTimeout != null && !descriptor.lifecycle.supportsTimeout) {
                 diagnostics += Diagnostic("attempt timeout requires provider lifecycle timeout support", "$path.policy", map.get<YamlNode>("policy")?.location?.source() ?: node.location.source())
