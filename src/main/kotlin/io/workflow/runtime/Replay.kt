@@ -75,7 +75,7 @@ object WorkflowReplay {
     }
 
     fun replayOne(journal: WorkflowJournalStore, executionId: ExecutionId): ReplayResult =
-        replayExecution(journal, executionId)
+        replay(journal, executionId).single()
 
     private fun replayExecution(journal: WorkflowJournalStore, executionId: ExecutionId): ReplayResult {
         val assignments = journal.assignments().filter { it.executionId == executionId }
