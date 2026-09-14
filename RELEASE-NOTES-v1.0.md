@@ -6,10 +6,11 @@ checked-in conformance corpus is run with `./gradlew conformance`; the clean
 distribution gate is `./gradlew distributionSmokeTest`.
 
 The offline repository demonstration includes full snapshot reconstruction.
-Safety tests inject transient model-builder failure and a fake publication whose
-reply is lost after the external write; the runtime reconciles the stable
-invocation identity and publishes the recovered result once, without a duplicate
-external effect.
+Its public `release-fault-*` fixture injects a transient model-builder failure
+and a fake publication whose reply is lost after the external write; the runtime
+reconciles the stable invocation identity and publishes the recovered result
+once with `externalWrites: 1`. Both the conformance corpus and installed-
+distribution smoke execute this safety path.
 
 ## Explicitly absent from v1
 
