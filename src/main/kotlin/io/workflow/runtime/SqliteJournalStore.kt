@@ -335,7 +335,7 @@ class SqliteJournalStore @JvmOverloads constructor(
                     lexical_bindings_json TEXT NOT NULL,
                     discriminator_revision TEXT,
                     branch_tag TEXT,
-                    state TEXT NOT NULL CHECK(state IN ('pending', 'claimed', 'deferred', 'open', 'done')),
+                    state TEXT NOT NULL CHECK(state IN ('pending', 'claimed', 'deferred', 'open', 'done', 'stopped')),
                     claimed_by TEXT,
                     claimed_until TEXT,
                     deferred_requirements_json TEXT,
@@ -868,6 +868,25 @@ class SqliteJournalStore @JvmOverloads constructor(
         Unit
     }
 
+    override fun stopActivation(intentId: ActivationIntentId) = write { connection ->
+        require(exists(connection, "SELECT 1 FROM activation_intents WHERE id = ?", intentId.value)) {
+            "cannot stop an unknown activation intent"
+        }
+        require(!isState(connection, intentId, "done")) { "cannot stop a completed activation intent" }
+        connection.prepareStatement(
+            "UPDATE activation_intents SET state = 'stopped', claimed_by = NULL, claimed_until = NULL, deferred_requirements_json = NULL WHERE id = ?",
+        ).use { statement -> statement.setString(1, intentId.value); statement.executeUpdate() }
+        Unit
+    }
+
+    override fun stopExecution(executionId: ExecutionId) = write { connection ->
+        connection.prepareStatement(
+            "UPDATE activation_intents SET state = 'stopped', claimed_by = NULL, claimed_until = NULL, deferred_requirements_json = NULL " +
+                "WHERE execution_id = ? AND state != 'done'",
+        ).use { statement -> statement.setString(1, executionId.value); statement.executeUpdate() }
+        Unit
+    }
+
     override fun deferActivationIfMissing(intentId: ActivationIntentId, required: Set<RegisterKey>): Boolean = write { connection ->
         require(exists(connection, "SELECT 1 FROM activation_intents WHERE id = ?", intentId.value)) {
             "cannot defer an unknown activation intent"
@@ -899,6 +918,8 @@ class SqliteJournalStore @JvmOverloads constructor(
     }
 
     override fun isOpen(intentId: ActivationIntentId): Boolean = read { connection -> isState(connection, intentId, "open") }
+
+    override fun isStopped(intentId: ActivationIntentId): Boolean = read { connection -> isState(connection, intentId, "stopped") }
 
     override fun recordActivation(record: ActivationRecord) = write { connection ->
         val intent = findIntent(connection, record.intentId)

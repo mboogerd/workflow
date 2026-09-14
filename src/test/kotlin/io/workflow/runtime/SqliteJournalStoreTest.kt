@@ -16,6 +16,7 @@ import io.workflow.core.WorkflowVersionId
 import java.nio.file.Path
 import java.sql.DriverManager
 import java.time.Instant
+import java.time.Duration
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -62,6 +63,32 @@ class SqliteJournalStoreTest {
             val claimed = reopened.claimNextActivation(ExecutionId("e"))!!
             reopened.completeActivation(claimed.id)
             assertTrue(reopened.isCompleted(claimed.id))
+        }
+    }
+
+    @Test
+    fun `an expired claimed intent is recovered after reopening`() {
+        val path = tempDir.resolve("claimed.db")
+        val intent = io.workflow.core.ActivationIntent(
+            id = io.workflow.core.ActivationIntentId("claimed-intent"),
+            activationId = io.workflow.core.ActivationId("claimed-activation"),
+            producerId = ProducerId("p"), workflowId = WorkflowId("w"), workflowVersionId = WorkflowVersionId("w@1"),
+            executionId = ExecutionId("e"), contextId = ContextId("anonymous"), journalBatchId = JournalBatchId("startup"),
+            createdAt = Instant.EPOCH,
+        )
+        SqliteJournalStore(
+            path,
+            FixedClock(Instant.EPOCH),
+            DeterministicIdSource("claim-"),
+            claimLease = Duration.ofSeconds(30),
+        ).use { store ->
+            store.persistActivationIntents(listOf(intent))
+            assertEquals(intent, store.claimNextActivation(ExecutionId("e")))
+        }
+
+        SqliteJournalStore(path, FixedClock(Instant.EPOCH.plusSeconds(31))).use { reopened ->
+            assertEquals(1, reopened.recoverExpiredClaims())
+            assertEquals(intent, reopened.claimNextActivation(ExecutionId("e")))
         }
     }
 
