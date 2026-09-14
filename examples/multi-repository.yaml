@@ -1,0 +1,38 @@
+workflow:
+  id: multi-repository
+  version: 1
+  parameters:
+    repositories:
+      schema:
+        type: array
+        items:
+          type: object
+          fields:
+            repository: {schema: string}
+            commit: {schema: string}
+            dependencies:
+              schema: {type: array, items: string}
+  context:
+    inventory:
+      provider: demo.repository-inventory
+      version: 1
+      with:
+        repositories: {$ref: "$.parameters.repositories"}
+    models:
+      map:
+        over: {$ref: "$.inventory.repositories"}
+        context:
+          model:
+            provider: demo.repository-model
+            version: 1
+            with: {$ref: "$.item"}
+        output: model
+    topology:
+      provider: demo.dependency-topology
+      version: 1
+      with: {$ref: "$.models"}
+    architecture:
+      provider: demo.system-model
+      version: 1
+      with: {$ref: "$.topology"}
+  outputs: [topology, architecture]

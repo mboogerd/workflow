@@ -1,0 +1,9 @@
+{
+  "repositories": [
+    {"repository": "app/service", "commit": "svc-001", "dependencies": ["lib/core"]},
+    {"repository": "lib/core", "commit": "core-001", "dependencies": ["platform/base"]},
+    {"repository": "platform/base", "commit": "base-001", "dependencies": []},
+    {"repository": "cycle/left", "commit": "left-001", "dependencies": ["cycle/right"]},
+    {"repository": "cycle/right", "commit": "right-001", "dependencies": ["cycle/left"]}
+  ]
+}

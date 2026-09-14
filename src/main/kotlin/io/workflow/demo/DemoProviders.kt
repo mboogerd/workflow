@@ -13,6 +13,15 @@ import java.math.BigInteger
 object DemoProviders {
     const val READER = "demo.repository-reader"
     const val BUILDER = "demo.model-builder"
+    /** Providers used by the finite multi-repository example. */
+    const val INVENTORY = "demo.repository-inventory"
+    const val REPOSITORY_MODEL = "demo.repository-model"
+    const val TOPOLOGY = "demo.dependency-topology"
+    const val SYSTEM_MODEL = "demo.system-model"
+    const val INVENTORY_READER = INVENTORY
+    const val REPOSITORY_CONTEXT_BUILDER = REPOSITORY_MODEL
+    const val DEPENDENCY_RESOLVER = TOPOLOGY
+    const val SYSTEM_ARCHITECTURE = SYSTEM_MODEL
 
     private val string = ValueSchema.String
     private val sourceFile = ValueSchema.Object(mapOf(
@@ -43,7 +52,167 @@ object DemoProviders {
         "entities" to ValueSchema.Object.Field(ValueSchema.Array(entity)),
     ))
 
+    val repositoryInputSchema = ValueSchema.Object(mapOf(
+        "repository" to ValueSchema.Object.Field(string),
+        "commit" to ValueSchema.Object.Field(string),
+        "dependencies" to ValueSchema.Object.Field(ValueSchema.Array(string)),
+    ))
+    val repositoryInventorySchema = ValueSchema.Object(mapOf(
+        "repositories" to ValueSchema.Object.Field(ValueSchema.Array(repositoryInputSchema)),
+    ))
+    val dependencyEvidenceSchema = ValueSchema.Object(mapOf(
+        "sourcePath" to ValueSchema.Object.Field(string),
+        "startLine" to ValueSchema.Object.Field(ValueSchema.Integer),
+        "endLine" to ValueSchema.Object.Field(ValueSchema.Integer),
+        "relation" to ValueSchema.Object.Field(string),
+    ))
+    val dependencyEdgeSchema = ValueSchema.Object(mapOf(
+        "from" to ValueSchema.Object.Field(string),
+        "to" to ValueSchema.Object.Field(string),
+        "sourceModelRevision" to ValueSchema.Object.Field(string),
+        "targetModelRevision" to ValueSchema.Object.Field(string),
+        "evidence" to ValueSchema.Object.Field(ValueSchema.Array(dependencyEvidenceSchema)),
+    ))
+    val repositoryModelSchema = ValueSchema.Object(mapOf(
+        "repository" to ValueSchema.Object.Field(string),
+        "commit" to ValueSchema.Object.Field(string),
+        "revision" to ValueSchema.Object.Field(string),
+        "summary" to ValueSchema.Object.Field(string),
+        "dependencies" to ValueSchema.Object.Field(ValueSchema.Array(string)),
+        "entities" to ValueSchema.Object.Field(ValueSchema.Array(entity)),
+    ))
+    private val repositoryView = ValueSchema.Object(mapOf(
+        "repository" to ValueSchema.Object.Field(string),
+        "dependencies" to ValueSchema.Object.Field(ValueSchema.Array(dependencyEdgeSchema)),
+    ))
+    val topologySchema = ValueSchema.Object(mapOf(
+        "models" to ValueSchema.Object.Field(ValueSchema.Array(repositoryModelSchema)),
+        "edges" to ValueSchema.Object.Field(ValueSchema.Array(dependencyEdgeSchema)),
+        "outgoing" to ValueSchema.Object.Field(ValueSchema.Array(repositoryView)),
+        "incoming" to ValueSchema.Object.Field(ValueSchema.Array(repositoryView)),
+        "modelRevisions" to ValueSchema.Object.Field(ValueSchema.Array(string)),
+        "gatheredModelRevisions" to ValueSchema.Object.Field(ValueSchema.Array(string)),
+    ))
+    val resolvedTopologySchema = topologySchema
+    val systemArchitectureSchema = ValueSchema.Object(mapOf(
+        "repositories" to ValueSchema.Object.Field(ValueSchema.Array(string)),
+        "models" to ValueSchema.Object.Field(ValueSchema.Array(repositoryModelSchema)),
+        "edges" to ValueSchema.Object.Field(ValueSchema.Array(dependencyEdgeSchema)),
+        "outgoing" to ValueSchema.Object.Field(ValueSchema.Array(repositoryView)),
+        "incoming" to ValueSchema.Object.Field(ValueSchema.Array(repositoryView)),
+        "modelRevisions" to ValueSchema.Object.Field(ValueSchema.Array(string)),
+        "gatheredModelRevisions" to ValueSchema.Object.Field(ValueSchema.Array(string)),
+        "summary" to ValueSchema.Object.Field(string),
+    ))
+
     fun registry(): ProviderRegistry = ProviderRegistry().also { registry ->
+        registry.register(
+            ProviderDescriptor(INVENTORY, 1, repositoryInventorySchema, repositoryInventorySchema, effectClass = EffectClass.READ),
+        ) { request ->
+            val input = request.input as Value.ObjectValue
+            val repositories = (input.fields.getValue("repositories") as Value.ArrayValue).values
+                .map { it as Value.ObjectValue }
+                .sortedBy { (it.fields.getValue("repository") as Value.StringValue).value }
+            listOf(
+                ProviderLifecycleMessage.Emission(
+                    Value.ObjectValue(mapOf("repositories" to Value.ArrayValue(repositories))),
+                    EmissionId("inventory-${request.invocationId.value}"), request.invocationId, request.attemptId,
+                ),
+                ProviderLifecycleMessage.Completed,
+            )
+        }
+        registry.register(
+            ProviderDescriptor(REPOSITORY_MODEL, 1, repositoryInputSchema, repositoryModelSchema, effectClass = EffectClass.AGENTIC),
+        ) { request ->
+            val input = request.input as Value.ObjectValue
+            val repository = input.string("repository")
+            val commit = input.string("commit")
+            val dependencies = input.strings("dependencies").sorted()
+            val files = fixture(repository, commit)
+            val entities = files.map { file ->
+                val path = (file as Value.ObjectValue).string("path")
+                val lines = (file.fields.getValue("lines") as Value.IntegerValue).value
+                Value.ObjectValue(mapOf(
+                    "id" to Value.StringValue("file:$repository:$path"),
+                    "kind" to Value.StringValue("source-file"),
+                    "name" to Value.StringValue(path),
+                    "evidence" to Value.ArrayValue(listOf(Value.ObjectValue(mapOf(
+                        "sourcePath" to Value.StringValue(path),
+                        "startLine" to Value.IntegerValue(BigInteger.ONE),
+                        "endLine" to Value.IntegerValue(lines),
+                    )))),
+                ))
+            }
+            val revision = "$repository@$commit"
+            val model = Value.ObjectValue(mapOf(
+                "repository" to Value.StringValue(repository),
+                "commit" to Value.StringValue(commit),
+                "revision" to Value.StringValue(revision),
+                "summary" to Value.StringValue("${entities.size} source files in $repository at $commit"),
+                "dependencies" to Value.ArrayValue(dependencies.map(Value::StringValue)),
+                "entities" to Value.ArrayValue(entities),
+            ))
+            listOf(ProviderLifecycleMessage.Emission(model, EmissionId("repository-model-${request.invocationId.value}"), request.invocationId, request.attemptId), ProviderLifecycleMessage.Completed)
+        }
+        registry.register(
+            ProviderDescriptor(TOPOLOGY, 1, ValueSchema.Array(repositoryModelSchema), topologySchema, effectClass = EffectClass.PURE),
+        ) { request ->
+            val models = (request.input as Value.ArrayValue).values.map { it as Value.ObjectValue }
+                .sortedBy { it.string("repository") }
+            val byRepository = models.associateBy { it.string("repository") }
+            fun edge(from: Value.ObjectValue, to: String): Value.ObjectValue {
+                val target = byRepository[to]
+                val targetRevision = target?.string("revision") ?: "$to@missing"
+                return Value.ObjectValue(mapOf(
+                    "from" to Value.StringValue(from.string("repository")),
+                    "to" to Value.StringValue(to),
+                    "sourceModelRevision" to Value.StringValue(from.string("revision")),
+                    "targetModelRevision" to Value.StringValue(targetRevision),
+                    "evidence" to Value.ArrayValue(listOf(Value.ObjectValue(mapOf(
+                        "sourcePath" to Value.StringValue("repository-manifest.yaml"),
+                        "startLine" to Value.IntegerValue(BigInteger.ONE),
+                        "endLine" to Value.IntegerValue(BigInteger.ONE),
+                        "relation" to Value.StringValue("declared dependency"),
+                    )))),
+                ))
+            }
+            val edges = models.flatMap { model -> model.strings("dependencies").sorted().map { edge(model, it) } }
+                .sortedWith(compareBy({ it.string("from") }, { it.string("to") }))
+            fun view(repository: String, values: List<Value.ObjectValue>) = Value.ObjectValue(mapOf(
+                "repository" to Value.StringValue(repository),
+                "dependencies" to Value.ArrayValue(values),
+            ))
+            val outgoing = models.map { model -> view(model.string("repository"), edges.filter { it.string("from") == model.string("repository") }) }
+            val incoming = models.map { model -> view(model.string("repository"), edges.filter { it.string("to") == model.string("repository") }.sortedBy { it.string("from") }) }
+            val revisions = models.map { it.string("revision") }.sorted()
+            val topology = Value.ObjectValue(mapOf(
+                "models" to Value.ArrayValue(models),
+                "edges" to Value.ArrayValue(edges),
+                "outgoing" to Value.ArrayValue(outgoing),
+                "incoming" to Value.ArrayValue(incoming),
+                "modelRevisions" to Value.ArrayValue(revisions.map(Value::StringValue)),
+                "gatheredModelRevisions" to Value.ArrayValue(revisions.map(Value::StringValue)),
+            ))
+            listOf(ProviderLifecycleMessage.Emission(topology, EmissionId("topology-${request.invocationId.value}"), request.invocationId, request.attemptId), ProviderLifecycleMessage.Completed)
+        }
+        registry.register(
+            ProviderDescriptor(SYSTEM_MODEL, 1, topologySchema, systemArchitectureSchema, effectClass = EffectClass.PURE),
+        ) { request ->
+            val topology = request.input as Value.ObjectValue
+            val models = topology.objects("models").sortedBy { it.string("repository") }
+            val revisions = topology.strings("gatheredModelRevisions").sorted()
+            val architecture = Value.ObjectValue(mapOf(
+                "repositories" to Value.ArrayValue(models.map { Value.StringValue(it.string("repository")) }),
+                "models" to Value.ArrayValue(models),
+                "edges" to Value.ArrayValue(topology.objects("edges")),
+                "outgoing" to Value.ArrayValue(topology.objects("outgoing")),
+                "incoming" to Value.ArrayValue(topology.objects("incoming")),
+                "modelRevisions" to Value.ArrayValue(revisions.map(Value::StringValue)),
+                "gatheredModelRevisions" to Value.ArrayValue(revisions.map(Value::StringValue)),
+                "summary" to Value.StringValue("${models.size} repository models and ${topology.objects("edges").size} dependency edges"),
+            ))
+            listOf(ProviderLifecycleMessage.Emission(architecture, EmissionId("system-${request.invocationId.value}"), request.invocationId, request.attemptId), ProviderLifecycleMessage.Completed)
+        }
         registry.register(
             ProviderDescriptor(READER, 1, readerInput, snapshot, effectClass = EffectClass.READ),
         ) { request ->
@@ -104,4 +273,13 @@ object DemoProviders {
             Value.ObjectValue(mapOf("path" to Value.StringValue("README.md"), "language" to Value.StringValue("markdown"), "lines" to Value.IntegerValue(10))),
         )
     }
+
+    private fun Value.ObjectValue.string(name: String): String =
+        (fields.getValue(name) as Value.StringValue).value
+
+    private fun Value.ObjectValue.strings(name: String): List<String> =
+        (fields.getValue(name) as Value.ArrayValue).values.map { (it as Value.StringValue).value }
+
+    private fun Value.ObjectValue.objects(name: String): List<Value.ObjectValue> =
+        (fields.getValue(name) as Value.ArrayValue).values.map { it as Value.ObjectValue }
 }
