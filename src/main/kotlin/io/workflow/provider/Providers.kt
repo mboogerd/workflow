@@ -39,6 +39,8 @@ data class ReconciliationRequest(
     val providerVersion: Int,
     val invocationId: InvocationId,
     val idempotencyKey: String = invocationId.value,
+    /** Physical identity of this reconciliation call, distinct from the effect attempt. */
+    val reconciliationAttemptId: AttemptId? = null,
     val attemptId: AttemptId? = null,
 ) {
     init { require(formatVersion == 1) { "unsupported reconciliation protocol format $formatVersion" } }
@@ -62,6 +64,9 @@ data class ReconciliationResult(
         require(formatVersion == 1) { "unsupported reconciliation protocol format $formatVersion" }
         require(disposition != ReconciliationDisposition.DEFINITELY_APPLIED || recordedResult != null) {
             "a definitely-applied reconciliation result must include the recorded provider result"
+        }
+        require(disposition == ReconciliationDisposition.DEFINITELY_APPLIED || recordedResult == null) {
+            "only a definitely-applied reconciliation result may include a recorded provider result"
         }
     }
 }
@@ -92,7 +97,7 @@ data class ProviderDescriptor(
      * Required for effectful/agentic providers.  It remains nullable solely so
      * the compiler can give a source-location diagnostic for legacy descriptors.
      */
-    val idempotency: IdempotencyContract? = IdempotencyContract(ReconciliationMode.HUMAN_INTERVENTION),
+    val idempotency: IdempotencyContract? = null,
     val implementationBinding: String = "in-process",
     val protocolFormatVersion: Int = 1,
     val compatibility: ProviderCompatibility = ProviderCompatibility(),

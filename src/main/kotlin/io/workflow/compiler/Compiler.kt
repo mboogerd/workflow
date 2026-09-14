@@ -811,6 +811,14 @@ class WorkflowCompiler(
                     node.location.source(),
                 )
             }
+            if (descriptor.idempotency?.mode == io.workflow.provider.ReconciliationMode.QUERY_BY_INVOCATION &&
+                registration.implementation !is io.workflow.provider.ReconciliationProviderImplementation) {
+                diagnostics += Diagnostic(
+                    "reconcile-by-key provider descriptor requires a reconciliation implementation",
+                    path,
+                    node.location.source(),
+                )
+            }
             if (executionPolicy.maximumAttempts > 1 && descriptor.effectClass !in setOf(EffectClass.PURE, EffectClass.READ)) {
                 when (descriptor.idempotency?.mode) {
                     io.workflow.provider.ReconciliationMode.IDEMPOTENT_BY_INVOCATION,
