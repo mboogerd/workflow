@@ -1,0 +1,1 @@
+{"id":"schemas","formatVersion":1,"requirementReferences":["schemas.md#validation-and-compatibility","README.md#cross-cutting-invariants"],"workflowYaml":"workflow:\n  id: bad-schema\n  version: 1\n  context: {value: {provider: missing, version: 1}}\n  outputs: [value]","expectedFailure":"any"}

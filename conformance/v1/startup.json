@@ -1,0 +1,1 @@
+{"id":"startup","formatVersion":1,"requirementReferences":["core-model.md#activation","execution-semantics.md#startup","README.md#cross-cutting-invariants"],"workflow":"examples/hello-expression.yaml","parameters":{"name":"Workflow"},"expectedOutputs":{"greeting-copy":"Hello, Workflow!"},"expectedRecords":{"minimumAssignments":2},"replay":true}

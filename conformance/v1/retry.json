@@ -1,0 +1,1 @@
+{"id":"retry","formatVersion":1,"requirementReferences":["failure-and-recovery.md#recovery-order","providers-and-effects.md#activation-and-emission"],"workflow":"examples/single-repository.yaml","parameters":{"repository":"demo/workflow","commit":"abc123"},"expectedRecords":{"providerEventTypes":["ATTEMPT_STARTED","COMPLETED"]},"replay":true}

@@ -1,0 +1,1 @@
+{"id":"agentic","formatVersion":1,"requirementReferences":["agentic-steps.md#required-descriptor-fields","agentic-steps.md#agentic-recovery","failure-and-recovery.md#recovery-decisions"],"workflow":"examples/single-repository.yaml","parameters":{"repository":"demo/workflow","commit":"abc123"},"replay":true}

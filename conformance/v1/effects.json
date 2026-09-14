@@ -1,0 +1,1 @@
+{"id":"effects","formatVersion":1,"requirementReferences":["providers-and-effects.md#invocation-identity","providers-and-effects.md#reconciliation","failure-and-recovery.md#recovery-order"],"workflow":"examples/single-repository.yaml","parameters":{"repository":"demo/workflow","commit":"abc123"},"expectedRecords":{"providerEventTypes":["INVOCATION"]},"replay":true}

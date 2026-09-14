@@ -1,0 +1,1 @@
+{"id":"failure","formatVersion":1,"requirementReferences":["failure-and-recovery.md#failure-model","values-and-bindings.md#boundary-data-model"],"workflowYaml":"workflow:\n  id: invalid-reference\n  version: 1\n  context: {value: {$ref: '$.unknown'}}\n  outputs: [value]","expectedFailure":"any"}

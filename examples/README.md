@@ -67,3 +67,35 @@ latest-only scheduling, or prevent a stale completion from being committed after
 a newer activation under the v1 policy. Non-main fixtures are explicitly
 filtered by the continuous inventory provider and produce an empty global
 snapshot.
+
+## v1 operator commands
+
+The generated launcher and Gradle development command expose the same surface:
+
+- `validate <workflow.yaml> [--providers demo]` checks YAML, provider bindings,
+  schemas, policies, and canonical IR compatibility without executing it.
+- `compile <workflow.yaml> --output <ir.json> [--providers demo]` writes the
+  canonical, portable IR artifact.
+- `run <workflow.yaml> --parameters <json-or-file> [--providers demo]` starts a
+  new execution and prints exported outputs; add `--inspect` for provenance JSON.
+- `inspect` and `stop` use the same workflow/parameter arguments for an
+  in-process execution. Durable administration uses the database commands below.
+- `resume <database> [--execution <id>] [--providers demo]` resumes durable
+  runnable work and open providers; `replay <database> [--execution <id>]`
+  rebuilds outputs from records and deliberately loads no provider profile.
+- `human-answer <database> --intervention <id> --answer <json>` supplies a typed
+  answer for an authorized paused recovery request.
+
+SQLite is selected explicitly by `--database <path>` for the continuous demo.
+Provider profiles are explicit (`--providers demo`); no ambient integration or
+credential discovery occurs. Successful operator commands print JSON when they
+return execution data, making them suitable for automation.
+
+## Release demonstration
+
+The continuous demonstration injects repeatable fixture events. The v1 safety
+suite additionally injects a transient model-builder failure and an ambiguous
+fake publication effect: retry uses the stable logical invocation identity, and
+the publication is reconciled from that identity before a retry can occur. The
+fault matrix is executable in `EffectReconciliationTest` and `RetryPolicyTest`;
+it proves one externally visible fake publication after a lost reply.
