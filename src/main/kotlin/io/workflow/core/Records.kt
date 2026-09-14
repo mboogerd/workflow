@@ -33,9 +33,19 @@ data class AssignmentMutation(
     val discriminatorRevision: AssignmentId? = null,
     val revision: Long = 1,
     val occurredAt: Instant,
+    /** Provenance for an assignment produced by one finite-map item. */
+    val mapActivationId: ActivationId? = null,
+    val mapItemId: String? = null,
+    val mapItemIndex: Int? = null,
+    val mapItemKey: String? = null,
+    val mapInputRevision: AssignmentId? = null,
     val formatVersion: Int = 1,
     val mutationOrdinal: Int = 0,
-)
+) {
+    val parentMapActivationId: ActivationId? get() = mapActivationId
+    val itemIdentity: String? get() = mapItemId
+    val parentInputRevision: AssignmentId? get() = mapInputRevision
+}
 data class JournalBatch(
     val journalBatchId: JournalBatchId,
     val mutations: List<AssignmentMutation>,
@@ -56,6 +66,13 @@ data class ActivationIntent(
     val journalBatchId: JournalBatchId, val createdAt: Instant,
     /** The immutable register-revision snapshot captured by this activation. */
     val dependencyRevisions: Map<RegisterId, AssignmentId> = emptyMap(),
+    /** Optional finite-map item provenance and immutable lexical snapshot. */
+    val mapActivationId: ActivationId? = null,
+    val mapItemId: String? = null,
+    val mapItemIndex: Int? = null,
+    val mapItemKey: String? = null,
+    val mapInputRevision: AssignmentId? = null,
+    val parentContextId: ContextId? = null,
     /** Generic nesting data shared with later compound producer runtimes. */
     val parentActivationId: ActivationId? = null,
     val targetRegisterId: RegisterId? = null,
@@ -65,4 +82,7 @@ data class ActivationIntent(
     val branchTag: String? = null,
 ) {
     val intentId: ActivationIntentId get() = id
+    val parentMapActivationId: ActivationId? get() = mapActivationId
+    val itemIdentity: String? get() = mapItemId
+    val parentInputRevision: AssignmentId? get() = mapInputRevision
 }
