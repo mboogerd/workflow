@@ -277,4 +277,101 @@ class MatchRuntimeTest {
         assertTrue(result.failures.single().contains("MATCH_UNKNOWN_TAG"))
         assertTrue(result.journal.assignments().none { it.registerId == match.registerId })
     }
+
+    @Test
+    fun `expression branch receives captured match value and writes the match register`() {
+        val compilation = WorkflowCompiler().compile(
+            yaml("""
+              Ready: {${'$'}concat: ["ready:", {${'$'}ref: "${'$'}.match.value"}]}
+              Failed: failed
+            """),
+        )
+        assertTrue(compilation.isValid, compilation.diagnostics.joinToString())
+
+        val result = InMemoryWorkflowRunner(
+            compiler = WorkflowCompiler(),
+            idSource = DeterministicIdSource("expression-"),
+            clock = FixedClock(Instant.EPOCH),
+        ).execute(
+            compilation.ir!!,
+            mapOf("result" to Value.ObjectValue(mapOf(
+                "kind" to Value.StringValue("Ready"),
+                "value" to Value.StringValue("payload"),
+            ))),
+            ExecutionId("expression-branch"),
+        )
+
+        assertTrue(result.isSuccessful, result.failures.joinToString())
+        assertEquals(Value.StringValue("ready:payload"), result.outputs.getValue("output").value)
+        val assignment = result.journal.assignments().single { it.registerId.value.endsWith("/register/output") }
+        assertTrue(assignment.parentActivationId != null)
+    }
+
+    @Test
+    fun `selected branch waits for required outer binding before invoking`() {
+        val seenInput = mutableListOf<Value>()
+        val registry = ProviderRegistry()
+        registry.register(descriptor("branch")) { request ->
+            seenInput += request.input
+            listOf(
+                ProviderLifecycleMessage.Emission(
+                    Value.StringValue("branch-result"), EmissionId("branch"), request.invocationId, request.attemptId,
+                ),
+                ProviderLifecycleMessage.Completed,
+            )
+        }
+        val compilation = WorkflowCompiler(registry).compile(
+            """
+            workflow:
+              id: deferred-branch
+              version: 1
+              parameters:
+                result:
+                  schema:
+                    type: tagged-union
+                    discriminator: kind
+                    variants:
+                      Ready:
+                        type: object
+                        fields:
+                          kind: {schema: string}
+                          value: {schema: string}
+                      Failed:
+                        type: object
+                        fields:
+                          kind: {schema: string}
+                          error: {schema: string}
+              context:
+                output:
+                  schema: string
+                  match:
+                    value: {${'$'}ref: "${'$'}.parameters.result"}
+                    cases:
+                      Ready:
+                        provider: branch
+                        version: 1
+                        with: {${'$'}ref: "${'$'}.later"}
+                      Failed: fallback
+                later: ready-input
+              outputs: [output]
+            """.trimIndent(),
+        )
+        assertTrue(compilation.isValid, compilation.diagnostics.joinToString())
+
+        val result = InMemoryWorkflowRunner(
+            compiler = WorkflowCompiler(registry),
+            idSource = DeterministicIdSource("deferred-"),
+            clock = FixedClock(Instant.EPOCH),
+        ).execute(
+            compilation.ir!!,
+            mapOf("result" to Value.ObjectValue(mapOf(
+                "kind" to Value.StringValue("Ready"), "value" to Value.StringValue("unused"),
+            ))),
+            ExecutionId("deferred-branch"),
+        )
+
+        assertTrue(result.isSuccessful, result.failures.joinToString())
+        assertEquals(listOf(Value.StringValue("ready-input")), seenInput)
+        assertEquals(Value.StringValue("branch-result"), result.outputs.getValue("output").value)
+    }
 }
