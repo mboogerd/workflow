@@ -57,6 +57,7 @@ class CompilerMatchMapTest {
         val map = register.map
         assertNotNull(map)
         assertEquals(MapResultOrdering.ARRAY_INDEX, map!!.ordering)
+        assertEquals(MapItemIdentityPolicy.ARRAY_INDEX, map.itemIdentityPolicy)
         assertEquals("value", map.output)
         assertEquals(ValueSchema.Array(ValueSchema.String), register.schema)
         assertEquals(listOf("mapped"), result.ir.outputs)
@@ -85,6 +86,7 @@ class CompilerMatchMapTest {
         assertTrue(second.isValid, second.diagnostics.joinToString())
         assertEquals(first.ir!!.contentHash, second.ir!!.contentHash)
         assertEquals(MapResultOrdering.OBJECT_KEY, first.ir.registers.single().map!!.ordering)
+        assertEquals(MapItemIdentityPolicy.OBJECT_KEY, first.ir.registers.single().map!!.itemIdentityPolicy)
     }
 
     @Test
@@ -159,6 +161,45 @@ class CompilerMatchMapTest {
         )
         assertTrue(result.isValid, result.diagnostics.joinToString())
         assertEquals(ValueSchema.Object(mapOf("a" to ValueSchema.Object.Field(ValueSchema.String), "b" to ValueSchema.Object.Field(ValueSchema.String))), result.ir!!.registers.single { it.name == "mapped" }.schema)
+    }
+
+    @Test
+    fun `map nested in match retains match lexical scope`() {
+        val result = compiler.compile(
+            """
+            workflow:
+              id: nested-match-map
+              version: 1
+              parameters:
+                result:
+                  schema:
+                    type: tagged-union
+                    discriminator: kind
+                    variants:
+                      Ready:
+                        type: object
+                        fields:
+                          kind: {schema: string}
+                          prefix: {schema: string}
+                          items: {schema: {type: array, items: string}}
+              context:
+                handled:
+                  match:
+                    value: {${'$'}ref: '${'$'}.parameters.result'}
+                    cases:
+                      Ready:
+                        map:
+                          over: {${'$'}ref: '${'$'}.match.items'}
+                          context:
+                            value:
+                              ${'$'}concat: [{${'$'}ref: '${'$'}.match.prefix'}, {${'$'}ref: '${'$'}.item'}]
+                          output: value
+              outputs: [handled]
+            """.trimIndent(),
+        )
+
+        assertTrue(result.isValid, result.diagnostics.joinToString())
+        assertEquals(ValueSchema.Array(ValueSchema.String), result.ir!!.registers.single().schema)
     }
 
     private val compiler = WorkflowCompiler()

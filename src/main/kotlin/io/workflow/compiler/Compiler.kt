@@ -100,6 +100,9 @@ data class CompiledProvider(
 /** The deterministic ordering used when a finite map gathers its item results. */
 enum class MapResultOrdering { ARRAY_INDEX, OBJECT_KEY }
 
+/** Stable identity source for expanded items in one map activation. */
+enum class MapItemIdentityPolicy { ARRAY_INDEX, OBJECT_KEY }
+
 /** A producer in a nested graph. Expression/provider fields remain available
  * on [CompiledRegister] for compatibility with the first two milestones. */
 sealed interface CompiledProducer {
@@ -160,6 +163,7 @@ data class CompiledMap(
     val output: String,
     val outputSchema: ValueSchema,
     val ordering: MapResultOrdering,
+    val itemIdentityPolicy: MapItemIdentityPolicy,
 ) {
     /** Alias matching the authoring key. */
     val over: io.workflow.compiler.Expression get() = input
@@ -647,8 +651,8 @@ class WorkflowCompiler(
                     parameters = parameters,
                     outerSchemas = schemas.filterKeys { it in visibleNames },
                     outerNames = visibleNames,
-                    lexicalRoots = setOf("item", "key"),
-                    lexicalSchemas = mapOf(
+                    lexicalRoots = lexicalRoots + setOf("item", "key"),
+                    lexicalSchemas = lexicalSchemas + mapOf(
                         "item" to when (inputSchema) {
                             is ValueSchema.Array -> inputSchema.items
                             is ValueSchema.Object -> inputSchema.fields.values.map { it.schema }.distinct().singleOrNull() ?: ValueSchema.Any
@@ -680,7 +684,13 @@ class WorkflowCompiler(
                     else -> ValueSchema.Any
                 }
                 compatible(resultSchema, draft.explicitSchema, "${draft.path}.schema")
-                val map = if (output != null && selected != null) CompiledMap(draft.value, bodyScope.registers, output, itemSchema, ordering) else null
+                val identityPolicy = when (ordering) {
+                    MapResultOrdering.ARRAY_INDEX -> MapItemIdentityPolicy.ARRAY_INDEX
+                    MapResultOrdering.OBJECT_KEY -> MapItemIdentityPolicy.OBJECT_KEY
+                }
+                val map = if (output != null && selected != null) {
+                    CompiledMap(draft.value, bodyScope.registers, output, itemSchema, ordering, identityPolicy)
+                } else null
                 val bodyDependencies = bodyScope.registers.flatMap { it.dependencies }.filter { it in visibleNames }
                 val allDeps = (deps(draft.value) + bodyDependencies).filter { it in visibleNames }.distinct().sorted()
                 val node = if (map != null) CompiledProducer.Map(map, producerId, resultSchema, allDeps, source)
@@ -1311,6 +1321,7 @@ private object CanonicalIrJson {
         "output" to JsonPrimitive(map.output),
         "outputSchema" to schema(map.outputSchema),
         "ordering" to JsonPrimitive(map.ordering.name.lowercase()),
+        "itemIdentityPolicy" to JsonPrimitive(map.itemIdentityPolicy.name.lowercase()),
     ).toSortedMap())
     private fun expression(expression: Expression): JsonElement = when (expression) {
         is Expression.Literal -> JsonObject(mapOf("kind" to JsonPrimitive("literal"), "value" to jsonValue(expression.value)))
