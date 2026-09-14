@@ -19,10 +19,11 @@ cd "$scratch"
 database="$scratch/continuous.db"
 "$launcher" demo continuous-repositories start --database "$database" >/dev/null
 "$launcher" demo continuous-repositories resume --database "$database" >/dev/null
-safety="$($launcher demo continuous-repositories emit --database "$database" --event '{"repository":"app/service","branch":"main","deliveryId":"release-safety","commit":"release-fault-a"}')"
-grep -q '"externalWrites":1' <<<"$safety"
-grep -q '"type":"retry_scheduled"' <<<"$safety"
-grep -q '"type":"reconciliation_decision"' <<<"$safety"
+safety_file="$scratch/release-safety.json"
+"$launcher" demo continuous-repositories emit --database "$database" --event '{"repository":"app/service","branch":"main","deliveryId":"release-safety","commit":"release-fault-a"}' >"$safety_file"
+grep -q '"externalWrites":1' "$safety_file"
+grep -q '"type":"retry_scheduled"' "$safety_file"
+grep -q '"type":"reconciliation_decision"' "$safety_file"
 "$launcher" demo continuous-repositories inspect --database "$database" >/dev/null
 "$launcher" replay "$database" >/dev/null
 "$launcher" demo continuous-repositories stop --database "$database" >/dev/null

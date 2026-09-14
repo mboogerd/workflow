@@ -15,6 +15,7 @@ import io.workflow.provider.ReconciliationProviderImplementation
 import io.workflow.provider.ReconciliationRequest
 import io.workflow.provider.ReconciliationResult
 import java.math.BigInteger
+import java.util.concurrent.ConcurrentHashMap
 
 /** Deterministic, offline providers used by the single-repository example. */
 object DemoProviders {
@@ -132,7 +133,7 @@ object DemoProviders {
     ))
 
     fun registry(): ProviderRegistry = ProviderRegistry().also { registry ->
-        val modelAttempts = linkedMapOf<String, Int>()
+        val modelAttempts = ConcurrentHashMap<String, Int>()
         val publication = FakeArchitecturePublication()
         registry.register(
             ProviderDescriptor(COMMIT_EVENTS, 1, ValueSchema.Any, commitEventSchema, effectClass = EffectClass.READ),
@@ -378,7 +379,7 @@ object DemoProviders {
 
     /** Lost-reply fixture: one external write, then reconciliation returns that recorded result. */
     private class FakeArchitecturePublication : ReconciliationProviderImplementation {
-        private val applied = linkedMapOf<String, Value>()
+        private val applied = ConcurrentHashMap<String, Value>()
 
         override fun invoke(request: io.workflow.provider.ProviderInvocationRequest): Iterable<ProviderLifecycleMessage> {
             check(request.invocationId.value !in applied) { "duplicate fake publication" }
