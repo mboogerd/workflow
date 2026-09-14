@@ -27,23 +27,50 @@ data class ProviderExecutionPolicy(
         backoffSchedule.getOrElse(attemptNumber - 1) { Duration.ZERO }
 
     companion object {
-        /** Accept both kebab-case YAML fields and the canonical camel-case IR fields. */
+        val fieldNames = setOf(
+            "maximum-attempts", "retryable-error-classes", "backoff-schedule-millis",
+            "attempt-timeout-millis", "activation-deadline-millis", "cancellation-grace-millis",
+        )
+
+        /** Parse the exact v1 policy shape retained unchanged in canonical IR. */
         fun from(value: Value): ProviderExecutionPolicy {
-            val fields = (value as? Value.ObjectValue)?.fields ?: return ProviderExecutionPolicy()
-            fun field(vararg names: String) = names.firstNotNullOfOrNull(fields::get)
-            fun integer(vararg names: String): Long? = (field(*names) as? Value.IntegerValue)?.value?.toLong()
-            fun duration(vararg names: String): Duration? = integer(*names)?.let(Duration::ofMillis)
-            fun strings(vararg names: String): Set<String> = ((field(*names) as? Value.ArrayValue)?.values ?: emptyList())
-                .mapNotNull { (it as? Value.StringValue)?.value }.toSet()
-            fun durations(vararg names: String): List<Duration> = ((field(*names) as? Value.ArrayValue)?.values ?: emptyList())
-                .mapNotNull { (it as? Value.IntegerValue)?.value?.toLong()?.let(Duration::ofMillis) }
+            val fields = (value as? Value.ObjectValue)?.fields
+                ?: throw IllegalArgumentException("policy must be an object")
+            val unknown = fields.keys - fieldNames
+            require(unknown.isEmpty()) { "unknown fields: ${unknown.sorted().joinToString()}" }
+            fun integer(name: String): Long? = fields[name]?.let { field ->
+                require(field is Value.IntegerValue) { "$name must be an integer" }
+                try { field.value.longValueExact() } catch (_: ArithmeticException) {
+                    throw IllegalArgumentException("$name is outside the 64-bit integer range")
+                }
+            }
+            fun duration(name: String): Duration? = integer(name)?.let(Duration::ofMillis)
+            fun strings(name: String): Set<String> = fields[name]?.let { field ->
+                require(field is Value.ArrayValue) { "$name must be an array of strings" }
+                field.values.map { entry ->
+                    require(entry is Value.StringValue && entry.value.isNotBlank()) { "$name must contain non-blank strings" }
+                    entry.value
+                }.toSet()
+            } ?: emptySet()
+            fun durations(name: String): List<Duration> = fields[name]?.let { field ->
+                require(field is Value.ArrayValue) { "$name must be an array of integer milliseconds" }
+                field.values.map { entry ->
+                    require(entry is Value.IntegerValue) { "$name must be an array of integer milliseconds" }
+                    val millis = try { entry.value.longValueExact() } catch (_: ArithmeticException) {
+                        throw IllegalArgumentException("$name contains a value outside the 64-bit integer range")
+                    }
+                    Duration.ofMillis(millis)
+                }
+            } ?: emptyList()
             return ProviderExecutionPolicy(
-                maximumAttempts = (integer("maximumAttempts", "maximum-attempts") ?: 1L).toInt(),
-                retryableErrorClasses = strings("retryableErrorClasses", "retryable-error-classes"),
-                backoffSchedule = durations("backoffScheduleMillis", "backoff-schedule-millis", "backoffSchedule", "backoff-schedule"),
-                attemptTimeout = duration("attemptTimeoutMillis", "attempt-timeout-millis"),
-                activationDeadline = duration("activationDeadlineMillis", "activation-deadline-millis"),
-                cancellationGrace = duration("cancellationGraceMillis", "cancellation-grace-millis"),
+                maximumAttempts = (integer("maximum-attempts") ?: 1L).also {
+                    require(it <= Int.MAX_VALUE) { "maximum-attempts is too large" }
+                }.toInt(),
+                retryableErrorClasses = strings("retryable-error-classes"),
+                backoffSchedule = durations("backoff-schedule-millis"),
+                attemptTimeout = duration("attempt-timeout-millis"),
+                activationDeadline = duration("activation-deadline-millis"),
+                cancellationGrace = duration("cancellation-grace-millis"),
             )
         }
     }
