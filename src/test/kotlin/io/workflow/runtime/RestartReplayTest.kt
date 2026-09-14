@@ -21,6 +21,7 @@ import io.workflow.provider.ProviderDescriptor
 import io.workflow.provider.ProviderImplementation
 import io.workflow.provider.ProviderLifecycleMessage
 import io.workflow.provider.ProviderRegistry
+import io.workflow.provider.deterministicAgenticDescriptor
 import io.workflow.provider.ReconciliationMode
 import java.nio.file.Path
 import java.time.Instant
@@ -200,7 +201,8 @@ class RestartReplayTest {
         it.register(
             ProviderDescriptor("restart-provider", 1, ValueSchema.Any, ValueSchema.String, effectClass = effectClass,
                 idempotency = if (effectClass in setOf(EffectClass.EFFECT, EffectClass.AGENTIC))
-                    IdempotencyContract(ReconciliationMode.HUMAN_INTERVENTION) else null),
+                    IdempotencyContract(ReconciliationMode.HUMAN_INTERVENTION) else null,
+                agentic = if (effectClass == EffectClass.AGENTIC) deterministicAgenticDescriptor("restart-test-v1") else null),
             implementation,
         )
     }

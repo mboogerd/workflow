@@ -16,7 +16,7 @@ import java.util.UUID
 
 fun main(args: Array<String>) {
     if (args.isEmpty() || args.first() == "--help") {
-        println("No command was given. Use validate, compile, run, inspect, stop, resume, replay, or demo.")
+        println("No command was given. Use validate, compile, run, inspect, stop, resume, replay, human-answer, or demo.")
         return
     }
     when (args.first()) {
@@ -49,11 +49,29 @@ fun main(args: Array<String>) {
         )
         "resume" -> resumeDatabase(args)
         "replay" -> replayDatabase(args)
+        "human-answer" -> submitHumanAnswer(args)
         "demo" -> continuousRepositoryDemo(args)
         else -> {
-            System.err.println("unknown command '${args.first()}'; use validate, compile, run, inspect, stop, resume, replay, or demo")
+            System.err.println("unknown command '${args.first()}'; use validate, compile, run, inspect, stop, resume, replay, human-answer, or demo")
             kotlin.system.exitProcess(2)
         }
+    }
+}
+
+private fun submitHumanAnswer(args: Array<String>) {
+    val database = databasePath(args, "human-answer") ?: return
+    val interventionIndex = args.indexOf("--intervention")
+    val answerIndex = args.indexOf("--answer")
+    require(interventionIndex >= 0 && interventionIndex + 1 < args.size) { "human-answer requires --intervention <id>" }
+    require(answerIndex >= 0 && answerIndex + 1 < args.size) { "human-answer requires --answer <json>" }
+    try {
+        SqliteJournalStore(database).use { store ->
+            val updated = store.submitAnswer(args[interventionIndex + 1], CanonicalValueJson.decode(args[answerIndex + 1]))
+            println("{\"interventionId\":\"${updated.id}\",\"state\":\"${updated.state.name.lowercase()}\",\"answer\":${CanonicalValueJson.encode(requireNotNull(updated.answer))}}")
+        }
+    } catch (failure: Exception) {
+        System.err.println("human answer failed: ${failure.message ?: "error"}")
+        kotlin.system.exitProcess(1)
     }
 }
 

@@ -39,6 +39,12 @@ import io.workflow.provider.ProviderExecutionPolicy
 import io.workflow.provider.EffectClass
 import io.workflow.provider.errorClass
 import io.workflow.provider.CancellableProviderImplementation
+import io.workflow.provider.AgenticProviderImplementation
+import io.workflow.provider.AgentBudgetMeter
+import io.workflow.provider.AgentCapabilityGate
+import io.workflow.provider.AgenticInvocationEnvironment
+import io.workflow.provider.ResolvedAgentMetadata
+import io.workflow.provider.AgentOperationResult
 import io.workflow.provider.IdempotencyContract
 import io.workflow.provider.ReconciliationDisposition
 import io.workflow.provider.ReconciliationMode
@@ -126,6 +132,13 @@ enum class ProviderEventType {
     ATTEMPT_TIMED_OUT,
     ACTIVATION_DEADLINE_EXCEEDED,
     CANCELLATION_IGNORED,
+    AGENTIC_METADATA_RESOLVED,
+    AGENTIC_BUDGET_REFUSED,
+    AGENTIC_CAPABILITY_REFUSED,
+    RECOVERY_PROPOSED,
+    RECOVERY_DECIDED,
+    HUMAN_INTERVENTION_REQUESTED,
+    HUMAN_INTERVENTION_ANSWERED,
     RECONCILIATION_REQUESTED,
     RECONCILIATION_ATTEMPTED,
     RECONCILIATION_RESULT,
@@ -267,7 +280,7 @@ interface ActivationClaimer {
  * makes persistence a backend choice while preserving the existing fast test
  * store.
  */
-interface WorkflowJournalStore : JournalBatchCommitter, CurrentViewProjection, ActivationClaimer {
+interface WorkflowJournalStore : JournalBatchCommitter, CurrentViewProjection, ActivationClaimer, RecoveryLedger {
     fun commit(proposal: JournalBatchProposal, activationIntents: Collection<ActivationIntent> = emptyList()): JournalBatch {
         require(proposal.mutations.size == 1) { "v1 journal batch must contain exactly one assignment mutation" }
         require(proposal.mutations.single().mutationOrdinal == 0) { "the only v1 mutation must have ordinal zero" }
@@ -369,6 +382,7 @@ class InMemoryJournalStore(
     private val assignmentsById = linkedMapOf<AssignmentId, AssignmentMutation>()
     private val executionBindings = linkedMapOf<ExecutionId, ExecutionBinding>()
     private val workflowDefinitions = linkedMapOf<Pair<WorkflowId, WorkflowVersionId>, WorkflowDefinitionRecord>()
+    private val recoveryLedger = InMemoryRecoveryLedger()
 
     private data class ExecutionBinding(
         val workflowVersionId: WorkflowVersionId,
@@ -556,6 +570,34 @@ class InMemoryJournalStore(
     override fun emissionRecords(): List<ProviderLifecycleEvent> = providerEmissions()
     override fun failureRecords(): List<ProviderLifecycleEvent> = providerFailures()
     override fun assignment(id: AssignmentId): AssignmentMutation? = synchronized(lock) { assignmentsById[id] }
+
+    override fun recordProposal(request: RecoveryRequest, proposal: RecoveryProposal) = synchronized(lock) {
+        recoveryLedger.recordProposal(request, proposal)
+    }
+
+    override fun recordDecision(request: RecoveryRequest, proposal: RecoveryProposal, validation: RecoveryValidation) = synchronized(lock) {
+        recoveryLedger.recordDecision(request, proposal, validation)
+    }
+
+    override fun pause(intervention: HumanIntervention) = synchronized(lock) { recoveryLedger.pause(intervention) }
+
+    override fun submitAnswer(id: String, answer: Value): HumanIntervention = synchronized(lock) {
+        recoveryLedger.submitAnswer(id, answer)
+    }
+
+    override fun intervention(id: String): HumanIntervention? = synchronized(lock) { recoveryLedger.intervention(id) }
+
+    override fun interventionHistory(id: String): List<HumanIntervention> = synchronized(lock) {
+        recoveryLedger.interventionHistory(id)
+    }
+
+    override fun recordedProposal(invocationId: InvocationId): RecoveryProposalRecord? = synchronized(lock) {
+        recoveryLedger.recordedProposal(invocationId)
+    }
+
+    override fun recordedDecision(invocationId: InvocationId): RecoveryDecisionRecord? = synchronized(lock) {
+        recoveryLedger.recordedDecision(invocationId)
+    }
 
     override fun recordProviderEvent(event: ProviderLifecycleEvent) = synchronized(lock) {
         require(providerEventIds.add(event.eventId)) { "provider event id is already committed" }
@@ -2419,10 +2461,39 @@ class InMemoryWorkflowRunner(
             discriminatorRevision = intent.discriminatorRevision,
         )
         val attemptStartedAt = clock.now()
+        val agentEnvironment = if (descriptor.effectClass == EffectClass.AGENTIC) {
+            val metadata = if (implementation is AgenticProviderImplementation) implementation.resolveMetadata(request, attemptStartedAt)
+            else ResolvedAgentMetadata(descriptor.agentic!!.modelSelectionPolicy, mapOf(
+                "strategyVersion" to descriptor.agentic.strategyVersion,
+                "promptVersion" to descriptor.agentic.promptVersion,
+            ), attemptStartedAt)
+            recordProviderEvent(
+                workflow, intent, invocationId, attemptId, ProviderEventType.AGENTIC_METADATA_RESOLVED,
+                causationId = attemptEvent.eventId, register = register, diagnostic = metadata.safeSummary(descriptor.secrets),
+            )
+            AgenticInvocationEnvironment(
+                descriptor.agentic!!, metadata,
+                AgentBudgetMeter(descriptor.agentic.budgets, attemptStartedAt) { result ->
+                    if (result is AgentOperationResult.Refused) recordProviderEvent(
+                        workflow, intent, invocationId, attemptId, ProviderEventType.AGENTIC_BUDGET_REFUSED,
+                        causationId = attemptEvent.eventId, register = register, diagnostic = "${result.code}: ${result.message}",
+                    )
+                },
+                AgentCapabilityGate(descriptor.agentic, binding.capabilities) { result ->
+                    if (result is AgentOperationResult.Refused) recordProviderEvent(
+                        workflow, intent, invocationId, attemptId, ProviderEventType.AGENTIC_CAPABILITY_REFUSED,
+                        causationId = attemptEvent.eventId, register = register, diagnostic = "${result.code}: ${result.message}",
+                    )
+                },
+            )
+        } else null
+        fun invokeProvider(): Iterable<ProviderLifecycleMessage> =
+            if (implementation is AgenticProviderImplementation) implementation.invokeAgentic(request, requireNotNull(agentEnvironment))
+            else implementation.invoke(request)
         val invokeExecutor = policy.attemptTimeout?.let { Executors.newSingleThreadExecutor() }
         val messages = try {
-            if (invokeExecutor == null) implementation.invoke(request)
-            else invokeExecutor.submit<List<ProviderLifecycleMessage>> { implementation.invoke(request).toList() }
+            if (invokeExecutor == null) invokeProvider()
+            else invokeExecutor.submit<List<ProviderLifecycleMessage>> { invokeProvider().toList() }
                 .get(policy.attemptTimeout.toMillis(), TimeUnit.MILLISECONDS)
         } catch (_: java.util.concurrent.TimeoutException) {
             val diagnostic = "ATTEMPT_TIMEOUT: limitMillis=${policy.attemptTimeout!!.toMillis()}"
@@ -2999,6 +3070,8 @@ class InMemoryWorkflowRunner(
         emission.emissionId.value.isBlank() -> "PROTOCOL_INVALID_EMISSION: emission id must not be blank"
         emission.emissionId in seenEmissionIds -> "PROTOCOL_DUPLICATE_EMISSION: emission id ${emission.emissionId.value} was already received for this invocation"
         !descriptor.emissionSchema.validate(emission.value).isValid -> "INVALID_OUTPUT: ${descriptor.emissionSchema.validate(emission.value).errors.joinToString { "${it.path}: ${it.message}" }}"
+        descriptor.agentic?.outputAcceptance?.requireNonNull == true && emission.value == Value.Null -> "INVALID_OUTPUT: agentic output must not be null"
+        descriptor.agentic?.outputAcceptance?.schema?.validate(emission.value)?.isValid == false -> "INVALID_OUTPUT: ${descriptor.agentic.outputAcceptance.schema.validate(emission.value).errors.joinToString { "${it.path}: ${it.message}" }}"
         !register.schema.validate(emission.value).isValid -> "INVALID_OUTPUT: ${register.schema.validate(emission.value).errors.joinToString { "${it.path}: ${it.message}" }}"
         else -> null
     }

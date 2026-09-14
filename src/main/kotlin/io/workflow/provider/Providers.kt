@@ -105,12 +105,28 @@ data class ProviderDescriptor(
     val deploymentStaticConfigFields: Set<String> = emptySet(),
     /** Descriptors may further constrain policy fields; v1 baseline fields remain portable. */
     val policySchema: ValueSchema = ValueSchema.Object(emptyMap(), additionalFields = true),
+    /** Required for agentic providers; deterministic providers intentionally need none. */
+    val agentic: AgenticDescriptor? = null,
 ) {
     init {
         require(providerId.isNotBlank()) { "provider id must not be blank" }
         require(version > 0) { "provider version must be positive" }
         require(protocolFormatVersion > 0) { "provider protocol format version must be positive" }
         require(implementationBinding.isNotBlank()) { "provider implementation binding must not be blank" }
+        require(effectClass != EffectClass.AGENTIC || agentic != null) {
+            "agentic providers must declare agentic metadata"
+        }
+        require(effectClass == EffectClass.AGENTIC || agentic == null) {
+            "agentic metadata is only valid for agentic providers"
+        }
+        agentic?.let { metadata ->
+            require(metadata.requiredCapabilities.all(capabilities::contains)) {
+                "agentic required capabilities must be declared by the provider"
+            }
+            require(metadata.requiredSecrets.all(secrets::contains)) {
+                "agentic required secrets must be declared by the provider"
+            }
+        }
     }
 
     val id: String get() = providerId
