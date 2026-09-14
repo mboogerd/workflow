@@ -2378,7 +2378,7 @@ class InMemoryWorkflowRunner(
         val invokeExecutor = policy.attemptTimeout?.let { Executors.newSingleThreadExecutor() }
         val messages = try {
             if (invokeExecutor == null) implementation.invoke(request)
-            else invokeExecutor.submit<Iterable<ProviderLifecycleMessage>> { implementation.invoke(request) }
+            else invokeExecutor.submit<List<ProviderLifecycleMessage>> { implementation.invoke(request).toList() }
                 .get(policy.attemptTimeout.toMillis(), TimeUnit.MILLISECONDS)
         } catch (_: java.util.concurrent.TimeoutException) {
             val diagnostic = "ATTEMPT_TIMEOUT: limitMillis=${policy.attemptTimeout!!.toMillis()}"
@@ -2663,8 +2663,8 @@ class InMemoryWorkflowRunner(
 
     /**
      * Retry decisions are events before the next physical attempt is started.
-     * The runner deliberately never sleeps: the due time is durable audit data,
-     * while an injected clock makes a resumed scheduler deterministic.
+     * Waiting is delegated to an injectable scheduler: the due time is durable
+     * audit data and deterministic tests advance their clock without sleeping.
      */
     private fun retryOrReturn(
         workflow: WorkflowIrDocument,
