@@ -1,0 +1,35 @@
+workflow:
+  id: continuous-repositories
+  version: 1
+  context:
+    # This provider remains open. The durable host injects offline fixture events.
+    event: {provider: demo.commit-events, version: 1}
+    # The global pipeline deliberately remains in the anonymous context.
+    inventory:
+      provider: demo.continuous-repository-inventory
+      version: 1
+      with: {$ref: "$.event"}
+    # This is intentionally separate from the global pipeline. Its explicit
+    # correlation id creates a per-repository projection with no cross-context read.
+    repositoryProjection:
+      provider: demo.repository-projection
+      version: 1
+      with: {$ref: "$.event"}
+    models:
+      map:
+        over: {$ref: "$.inventory.repositories"}
+        context:
+          model:
+            provider: demo.repository-model
+            version: 1
+            with: {$ref: "$.item"}
+        output: model
+    topology:
+      provider: demo.dependency-topology
+      version: 1
+      with: {$ref: "$.models"}
+    architecture:
+      provider: demo.system-model
+      version: 1
+      with: {$ref: "$.topology"}
+  outputs: [topology, architecture]

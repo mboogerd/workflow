@@ -99,3 +99,35 @@ future backend.
    authorized.
 9. The canonical IR, not YAML presentation details or a particular backend, is
    the durable workflow definition.
+
+## Continuous repository demonstration (v0.4)
+
+`examples/continuous-repositories.yaml` is an offline, SQLite-backed workflow
+that accepts repeated commit-event fixtures and creates one new complete
+repository/topology/system-model revision for each accepted event.
+
+Start an execution, then inject fixture events, inspect it, resume it after a
+process restart, or stop it administratively:
+
+```bash
+./gradlew run --args='demo continuous-repositories start --database build/demo-workflow.db'
+./gradlew run --args='demo continuous-repositories emit --database build/demo-workflow.db --event "{"repository":"app/service","branch":"main","deliveryId":"delivery-a","commit":"trigger-a"}"'
+./gradlew run --args='demo continuous-repositories inspect --database build/demo-workflow.db'
+./gradlew run --args='demo continuous-repositories resume --database build/demo-workflow.db'
+./gradlew run --args='demo continuous-repositories stop --database build/demo-workflow.db'
+```
+
+The source is an open in-process provider, so events survive a real restart
+through the journal and require neither a network service nor a process-local
+queue. Inspection emits stable JSON with each architecture revision's full
+dependency-revision chain back to its triggering event. The event's repository
+projection is routed to a distinct correlated context; the topology and system
+pipeline only reads anonymous-context inventory/map outputs and never performs
+cross-context aggregation.
+
+This v0.4 demo deliberately rebuilds every repository model for every accepted
+main-branch event. It does not deduplicate delivery IDs, perform incremental or
+latest-only scheduling, or prevent a stale completion from being committed after
+a newer activation under the v1 policy. Non-main fixtures are explicitly
+filtered by the continuous inventory provider and produce an empty global
+snapshot.

@@ -18,6 +18,10 @@ object DemoProviders {
     const val REPOSITORY_MODEL = "demo.repository-model"
     const val TOPOLOGY = "demo.dependency-topology"
     const val SYSTEM_MODEL = "demo.system-model"
+    /** Durable, controllable providers used by the continuous repository demonstration. */
+    const val COMMIT_EVENTS = "demo.commit-events"
+    const val CONTINUOUS_INVENTORY = "demo.continuous-repository-inventory"
+    const val REPOSITORY_PROJECTION = "demo.repository-projection"
     const val INVENTORY_READER = INVENTORY
     const val REPOSITORY_CONTEXT_BUILDER = REPOSITORY_MODEL
     const val DEPENDENCY_RESOLVER = TOPOLOGY
@@ -59,6 +63,16 @@ object DemoProviders {
     ))
     val repositoryInventorySchema = ValueSchema.Object(mapOf(
         "repositories" to ValueSchema.Object.Field(ValueSchema.Array(repositoryInputSchema)),
+    ))
+    /**
+     * The provider-facing event envelope deliberately preserves delivery id as
+     * audit data only.  The runtime treats every accepted emission as new work.
+     */
+    val commitEventSchema = ValueSchema.Object(mapOf(
+        "repository" to ValueSchema.Object.Field(string),
+        "branch" to ValueSchema.Object.Field(string),
+        "deliveryId" to ValueSchema.Object.Field(string),
+        "commit" to ValueSchema.Object.Field(string),
     ))
     val dependencyEvidenceSchema = ValueSchema.Object(mapOf(
         "sourcePath" to ValueSchema.Object.Field(string),
@@ -106,6 +120,40 @@ object DemoProviders {
     ))
 
     fun registry(): ProviderRegistry = ProviderRegistry().also { registry ->
+        registry.register(
+            ProviderDescriptor(COMMIT_EVENTS, 1, ValueSchema.Any, commitEventSchema, effectClass = EffectClass.READ),
+        ) {
+            // The host injects deterministic fixture events through its durable
+            // open-provider handle. No network service or process-local queue is involved.
+            listOf(ProviderLifecycleMessage.Open)
+        }
+        registry.register(
+            ProviderDescriptor(CONTINUOUS_INVENTORY, 1, commitEventSchema, repositoryInventorySchema, effectClass = EffectClass.READ),
+        ) { request ->
+            val event = request.input as Value.ObjectValue
+            val branch = event.string("branch")
+            val inventory = if (branch == "main") continuousInventory(event.string("commit")) else emptyList()
+            listOf(
+                ProviderLifecycleMessage.Emission(
+                    Value.ObjectValue(mapOf("repositories" to Value.ArrayValue(inventory))),
+                    EmissionId("continuous-inventory-${request.invocationId.value}"), request.invocationId, request.attemptId,
+                ),
+                ProviderLifecycleMessage.Completed,
+            )
+        }
+        registry.register(
+            ProviderDescriptor(REPOSITORY_PROJECTION, 1, commitEventSchema, commitEventSchema, effectClass = EffectClass.PURE),
+        ) { request ->
+            val event = request.input as Value.ObjectValue
+            listOf(
+                ProviderLifecycleMessage.Emission(
+                    event,
+                    EmissionId("repository-projection-${request.invocationId.value}"), request.invocationId, request.attemptId,
+                    event.string("repository"),
+                ),
+                ProviderLifecycleMessage.Completed,
+            )
+        }
         registry.register(
             ProviderDescriptor(INVENTORY, 1, repositoryInventorySchema, repositoryInventorySchema, effectClass = EffectClass.READ),
         ) { request ->
@@ -272,6 +320,30 @@ object DemoProviders {
             Value.ObjectValue(mapOf("path" to Value.StringValue(suffix), "language" to Value.StringValue("kotlin"), "lines" to Value.IntegerValue(if (commit.endsWith("2")) 24 else 18))),
             Value.ObjectValue(mapOf("path" to Value.StringValue("README.md"), "language" to Value.StringValue("markdown"), "lines" to Value.IntegerValue(10))),
         )
+    }
+
+    /** Authoritative finite fixtures for the v0.4 demonstration. */
+    private fun continuousInventory(triggerCommit: String): List<Value> {
+        val repositories = if (triggerCommit.endsWith("b") || triggerCommit.endsWith("-b")) {
+            listOf(
+                Triple("app/service", "svc-b", listOf("platform/base")),
+                Triple("platform/base", "base-a", emptyList()),
+                Triple("new/repository", "new-b", emptyList()),
+            )
+        } else {
+            listOf(
+                Triple("app/service", "svc-a", listOf("lib/core")),
+                Triple("lib/core", "core-a", listOf("platform/base")),
+                Triple("platform/base", "base-a", emptyList()),
+            )
+        }
+        return repositories.map { (repository, commit, dependencies) ->
+            Value.ObjectValue(mapOf(
+                "repository" to Value.StringValue(repository),
+                "commit" to Value.StringValue(commit),
+                "dependencies" to Value.ArrayValue(dependencies.map(Value::StringValue)),
+            ))
+        }
     }
 
     private fun Value.ObjectValue.string(name: String): String =
