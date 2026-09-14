@@ -77,7 +77,14 @@ data class CompiledRegister(
     val source: SourceLocation,
     /** Present only for a provider producer; ordinary expressions remain unchanged. */
     val provider: CompiledProvider? = null,
-)
+    /** Present for a `match` or `map` producer, and for all nested producers. */
+    val compiledProducer: CompiledProducer? = null,
+    val match: CompiledMatch? = null,
+    val map: CompiledMap? = null,
+) {
+    /** Name used by consumers that treat all producer forms uniformly. */
+    val producerNode: CompiledProducer? get() = compiledProducer
+}
 
 data class CompiledProvider(
     val providerId: String,
@@ -88,6 +95,78 @@ data class CompiledProvider(
     val policy: Value = Value.ObjectValue(emptyMap()),
 ) {
     val providerVersion: Int get() = version
+}
+
+/** The deterministic ordering used when a finite map gathers its item results. */
+enum class MapResultOrdering { ARRAY_INDEX, OBJECT_KEY }
+
+/** A producer in a nested graph. Expression/provider fields remain available
+ * on [CompiledRegister] for compatibility with the first two milestones. */
+sealed interface CompiledProducer {
+    val producerId: ProducerId
+    val schema: ValueSchema
+    val dependencies: List<String>
+    val source: SourceLocation
+
+    data class Expression(
+        val value: io.workflow.compiler.Expression,
+        override val producerId: ProducerId,
+        override val schema: ValueSchema,
+        override val dependencies: List<String>,
+        override val source: SourceLocation,
+    ) : CompiledProducer
+
+    data class Provider(
+        val value: CompiledProvider,
+        override val producerId: ProducerId,
+        override val schema: ValueSchema,
+        override val dependencies: List<String>,
+        override val source: SourceLocation,
+    ) : CompiledProducer
+
+    data class Match(
+        val value: CompiledMatch,
+        override val producerId: ProducerId,
+        override val schema: ValueSchema,
+        override val dependencies: List<String>,
+        override val source: SourceLocation,
+    ) : CompiledProducer
+
+    data class Map(
+        val value: CompiledMap,
+        override val producerId: ProducerId,
+        override val schema: ValueSchema,
+        override val dependencies: List<String>,
+        override val source: SourceLocation,
+    ) : CompiledProducer
+}
+
+/** A match discriminator and its exhaustive, canonically keyed branch graph. */
+data class CompiledMatch(
+    val discriminator: io.workflow.compiler.Expression,
+    val discriminatorSchema: ValueSchema.TaggedUnion,
+    val cases: Map<String, CompiledProducer>,
+    val outputSchema: ValueSchema,
+) {
+    /** Alias matching the authoring key. */
+    val value: io.workflow.compiler.Expression get() = discriminator
+    val caseProducers: Map<String, CompiledProducer> get() = cases
+}
+
+/** A finite scatter/gather graph. */
+data class CompiledMap(
+    val input: io.workflow.compiler.Expression,
+    val context: List<CompiledRegister>,
+    val output: String,
+    val outputSchema: ValueSchema,
+    val ordering: MapResultOrdering,
+) {
+    /** Alias matching the authoring key. */
+    val over: io.workflow.compiler.Expression get() = input
+    /** Body registers are the nested producer graph. */
+    val registers: List<CompiledRegister> get() = context
+    val body: List<CompiledRegister> get() = context
+    val resultOrdering: MapResultOrdering get() = ordering
 }
 
 data class WorkflowIrDocument(
@@ -107,6 +186,56 @@ private data class NodeInfo(val node: YamlNode, val path: String) {
     val location: SourceLocation
         get() = SourceLocation(node.location.line, node.location.column)
 }
+
+private sealed interface ProducerDraft {
+    val node: YamlNode
+    val path: String
+    val explicitSchema: ValueSchema?
+
+    data class Expression(
+        override val node: YamlNode,
+        override val path: String,
+        val value: io.workflow.compiler.Expression,
+        override val explicitSchema: ValueSchema?,
+    ) : ProducerDraft
+
+    data class Provider(
+        override val node: YamlNode,
+        override val path: String,
+        val value: CompiledProvider,
+        override val explicitSchema: ValueSchema?,
+    ) : ProducerDraft
+
+    data class Match(
+        override val node: YamlNode,
+        override val path: String,
+        val value: io.workflow.compiler.Expression,
+        val cases: kotlin.collections.Map<String, ProducerDraft>,
+        override val explicitSchema: ValueSchema?,
+    ) : ProducerDraft
+
+    data class Map(
+        override val node: YamlNode,
+        override val path: String,
+        val value: io.workflow.compiler.Expression,
+        val context: kotlin.collections.Map<String, ProducerDraft>,
+        val output: String?,
+        override val explicitSchema: ValueSchema?,
+    ) : ProducerDraft
+}
+
+private data class ScopeCompilation(
+    val registers: List<CompiledRegister>,
+    val schemas: Map<String, ValueSchema>,
+)
+
+private data class DraftCompilation(
+    val producer: CompiledProducer,
+    val expression: io.workflow.compiler.Expression,
+    val provider: CompiledProvider?,
+    val match: CompiledMatch?,
+    val map: CompiledMap?,
+)
 
 class WorkflowCompiler(
     private val maxDocumentCodePoints: Int = 1_000_000,
@@ -168,8 +297,7 @@ class WorkflowCompiler(
         val outputs = parseOutputs(workflow.get("outputs"), diagnostics)
         if (context == null || id == null || version == null) return CompilationResult(null, diagnostics)
 
-        val definitions = linkedMapOf<String, Pair<YamlNode, Expression>>()
-        val providerDefinitions = linkedMapOf<String, CompiledProvider>()
+        val definitions = linkedMapOf<String, ProducerDraft>()
         context.entries.forEach { (key, node) ->
             val name = key.content
             val path = "$.workflow.context.$name"
@@ -178,96 +306,22 @@ class WorkflowCompiler(
             }
             if (name in RESERVED_ROOTS) diagnostics += Diagnostic("register name '$name' is reserved", path, key.location.source())
             if (name in definitions) diagnostics += Diagnostic("duplicate register definition '$name'", path, key.location.source())
-            val producerFields = (node as? YamlMap)?.entries?.keys?.map { it.content }.orEmpty()
-            val provider = if ("provider" in producerFields) parseProvider(node, path, diagnostics) else null
-            producerFields.firstOrNull { it == "match" || it == "map" }?.let {
-                diagnostics += Diagnostic("producer form '$it' is not supported by this compiler", "$path.$it", node.location.source())
-            }
-            val expr = if (provider != null) provider.input else parseExpression(node, path, diagnostics)
-            if (expr != null && name !in definitions) definitions[name] = node to expr
-            if (provider != null && name !in providerDefinitions) providerDefinitions[name] = provider
+            parseProducer(node, path, diagnostics)?.let { if (name !in definitions) definitions[name] = it }
         }
-        val schemaExplicit = mutableMapOf<String, ValueSchema>()
-        val registers = mutableListOf<CompiledRegister>()
-        val names = definitions.keys
-        val depsByName = definitions.mapValues { (_, pair) -> dependencies(pair.second).filter { it in names }.distinct().sorted() }
-        detectCycles(depsByName, diagnostics, definitions)
-        val inferred = mutableMapOf<String, ValueSchema>()
-        providerDefinitions.forEach { (name, provider) ->
-            providerRegistry.resolve(provider.providerId, provider.version)?.descriptor?.let { descriptor ->
-                inferred[name] = descriptor.emissionSchema
-            }
-        }
-        val inferring = mutableSetOf<String>()
-        fun inferRegister(name: String): ValueSchema {
-            inferred[name]?.let { return it }
-            if (!inferring.add(name)) return ValueSchema.Any
-            val (node, expression) = definitions.getValue(name)
-            depsByName[name].orEmpty().forEach { inferRegister(it) }
-            val schema = inferExpression(expression, parameters, inferred, definitions.keys, emptySet(), diagnostics, "$.workflow.context.$name", node.location.source())
-            inferred[name] = schema
-            inferring -= name
-            return schema
-        }
-        definitions.forEach { (name, pair) ->
-            val explicit = parseEmbeddedSchema(pair.first, "$.workflow.context.$name.schema", diagnostics)
-            if (explicit != null) schemaExplicit[name] = explicit
-            val inferredSchema = providerDefinitions[name]?.let { provider ->
-                providerRegistry.resolve(provider.providerId, provider.version)?.descriptor?.emissionSchema
-            } ?: inferRegister(name)
-            val schema = explicit ?: inferredSchema
-            if (explicit != null && !inferredSchema.isCompatibleWith(explicit)) {
-                diagnostics += Diagnostic("expression schema ${schemaName(inferredSchema)} is incompatible with declared ${schemaName(explicit)}", "$.workflow.context.$name.schema", pair.first.location.source())
-            }
-            val identityPrefix = "$id@$version"
-            registers += CompiledRegister(
-                name = name,
-                registerId = RegisterId("$identityPrefix/register/$name"),
-                producerId = ProducerId("$identityPrefix/producer/$name"),
-                producer = pair.second,
-                dependencies = depsByName[name].orEmpty(),
-                schema = schema,
-                source = pair.first.location.source(),
-                provider = providerDefinitions[name],
-            )
-        }
-        providerDefinitions.forEach { (name, provider) ->
-            val descriptor = providerRegistry.resolve(provider.providerId, provider.version)?.descriptor ?: return@forEach
-            val configSchema = inferExpression(
-                provider.config,
-                parameters,
-                inferred,
-                definitions.keys,
-                emptySet(),
-                diagnostics,
-                "$.workflow.context.$name.config",
-                definitions.getValue(name).first.location.source(),
-            )
-            if (!configSchema.isCompatibleWith(descriptor.configurationSchema)) {
-                diagnostics += Diagnostic(
-                    "configuration schema ${schemaName(configSchema)} is incompatible with provider configuration ${schemaName(descriptor.configurationSchema)}",
-                    "$.workflow.context.$name.config",
-                    definitions.getValue(name).first.location.source(),
-                )
-            }
-            val inputSchema = inferExpression(
-                provider.input,
-                parameters,
-                inferred,
-                definitions.keys,
-                emptySet(),
-                diagnostics,
-                "$.workflow.context.$name.with",
-                definitions.getValue(name).first.location.source(),
-            )
-            if (!inputSchema.isCompatibleWith(descriptor.inputSchema)) {
-                diagnostics += Diagnostic(
-                    "bound input schema ${schemaName(inputSchema)} is incompatible with provider input ${schemaName(descriptor.inputSchema)}",
-                    "$.workflow.context.$name.with",
-                    definitions.getValue(name).first.location.source(),
-                )
-            }
-        }
+        val identityPrefix = "$id@$version"
+        val scope = compileScope(
+            definitions = definitions,
+            scopePath = "$.workflow.context",
+            identityPrefix = identityPrefix,
+            parameters = parameters,
+            outerSchemas = emptyMap(),
+            outerNames = emptySet(),
+            lexicalRoots = emptySet(),
+            lexicalSchemas = emptyMap(),
+            forbiddenNames = emptySet(),
+            diagnostics = diagnostics,
+        )
+        val registers = scope.registers
         outputs.forEachIndexed { index, output ->
             if (output !in definitions) diagnostics += Diagnostic("output '$output' is unreachable because no such register is defined", "$.workflow.outputs[$index]", location(workflow, "outputs"))
         }
@@ -284,6 +338,363 @@ class WorkflowCompiler(
         val hash = sha256(CanonicalIrJson.document(withoutHash, includeHash = false, includeSource = false))
         return CompilationResult(withoutHash.copy(contentHash = hash), emptyList())
     }
+
+    private fun parseProducer(node: YamlNode, path: String, diagnostics: MutableList<Diagnostic>): ProducerDraft? {
+        val map = node as? YamlMap
+        val fields = map?.entries?.keys?.map { it.content }.orEmpty()
+        val forms = fields.filter { it == "provider" || it == "match" || it == "map" }
+        if (forms.size > 1) {
+            diagnostics += Diagnostic("a producer mapping may contain only one producer form", path, node.location.source())
+            return null
+        }
+        val explicitSchema = parseEmbeddedSchema(node, "$path.schema", diagnostics)
+        return when (forms.singleOrNull()) {
+            "provider" -> parseProvider(node, path, diagnostics)?.let {
+                ProducerDraft.Provider(node, path, it, explicitSchema)
+            }
+            "match" -> parseMatch(node, path, explicitSchema, diagnostics)
+            "map" -> parseMap(node, path, explicitSchema, diagnostics)
+            else -> parseExpression(node, path, diagnostics)?.let {
+                ProducerDraft.Expression(node, path, it, explicitSchema)
+            }
+        }
+    }
+
+    private fun parseMatch(
+        node: YamlNode,
+        path: String,
+        explicitSchema: ValueSchema?,
+        diagnostics: MutableList<Diagnostic>,
+    ): ProducerDraft? {
+        val map = node as? YamlMap ?: run {
+            diagnostics += Diagnostic("match producer form is not supported: match producer must be a mapping", path, node.location.source())
+            return null
+        }
+        checkFields(map, setOf("match", "schema"), path, diagnostics)
+        val body = map.get<YamlNode>("match") as? YamlMap ?: run {
+            diagnostics += Diagnostic("match producer form is not supported: match requires a mapping", "$path.match", location(map, "match"))
+            return null
+        }
+        checkFields(body, setOf("value", "cases"), "$path.match", diagnostics)
+        val valueNode = body.get<YamlNode>("value") ?: run {
+            diagnostics += Diagnostic("match requires a discriminator value", "$path.match.value", location(body, "value"))
+            return null
+        }
+        val value = parseExpression(valueNode, "$path.match.value", diagnostics) ?: return null
+        val casesNode = body.get<YamlNode>("cases") as? YamlMap ?: run {
+            diagnostics += Diagnostic("match requires a cases mapping", "$path.match.cases", location(body, "cases"))
+            return null
+        }
+        val cases = linkedMapOf<String, ProducerDraft>()
+        casesNode.entries.forEach { (key, caseNode) ->
+            val tag = key.content
+            val casePath = "$path.match.cases.$tag"
+            if (tag.isBlank()) diagnostics += Diagnostic("match case name must not be empty", casePath, key.location.source())
+            if (tag in cases) diagnostics += Diagnostic("duplicate match case '$tag'", casePath, key.location.source())
+            parseProducer(caseNode, casePath, diagnostics)?.let { if (tag !in cases) cases[tag] = it }
+        }
+        return ProducerDraft.Match(node, path, value, cases, explicitSchema)
+    }
+
+    private fun parseMap(
+        node: YamlNode,
+        path: String,
+        explicitSchema: ValueSchema?,
+        diagnostics: MutableList<Diagnostic>,
+    ): ProducerDraft? {
+        val map = node as? YamlMap ?: run {
+            diagnostics += Diagnostic("map producer form is not supported: map producer must be a mapping", path, node.location.source())
+            return null
+        }
+        checkFields(map, setOf("map", "schema"), path, diagnostics)
+        val body = map.get<YamlNode>("map") as? YamlMap ?: run {
+            diagnostics += Diagnostic("map producer form is not supported: map requires a mapping", "$path.map", location(map, "map"))
+            return null
+        }
+        checkFields(body, setOf("over", "context", "output"), "$path.map", diagnostics)
+        val overNode = body.get<YamlNode>("over") ?: run {
+            diagnostics += Diagnostic("map requires an input under 'over'", "$path.map.over", location(body, "over"))
+            return null
+        }
+        val over = parseExpression(overNode, "$path.map.over", diagnostics) ?: return null
+        val contextNode = body.get<YamlNode>("context") as? YamlMap ?: run {
+            diagnostics += Diagnostic("map requires a nested context mapping", "$path.map.context", location(body, "context"))
+            return null
+        }
+        val context = linkedMapOf<String, ProducerDraft>()
+        contextNode.entries.forEach { (key, producerNode) ->
+            val name = key.content
+            val registerPath = "$path.map.context.$name"
+            if (!name.matches(Regex("[A-Za-z_][A-Za-z0-9_-]*"))) {
+                diagnostics += Diagnostic("register name is not a valid identifier", registerPath, key.location.source())
+            }
+            if (name in RESERVED_ROOTS) diagnostics += Diagnostic("register name '$name' is reserved", registerPath, key.location.source())
+            if (name in context) diagnostics += Diagnostic("duplicate register definition '$name'", registerPath, key.location.source())
+            parseProducer(producerNode, registerPath, diagnostics)?.let { if (name !in context) context[name] = it }
+        }
+        val outputNode = body.get<YamlNode>("output")
+        val output = (outputNode as? YamlScalar)?.let(::scalarValue) as? Value.StringValue
+        if (output == null) diagnostics += Diagnostic("map requires output to name one body register", "$path.map.output", location(body, "output"))
+        return ProducerDraft.Map(node, path, over, context, output?.value, explicitSchema)
+    }
+
+    private fun compileScope(
+        definitions: Map<String, ProducerDraft>,
+        scopePath: String,
+        identityPrefix: String,
+        parameters: Map<String, ValueSchema>,
+        outerSchemas: Map<String, ValueSchema>,
+        outerNames: Set<String>,
+        lexicalRoots: Set<String>,
+        lexicalSchemas: Map<String, ValueSchema>,
+        forbiddenNames: Set<String>,
+        diagnostics: MutableList<Diagnostic>,
+    ): ScopeCompilation {
+        definitions.keys.filter { it in forbiddenNames }.forEach { name ->
+            diagnostics += Diagnostic("nested register '$name' shadows an outer register", "$scopePath.$name", definitions.getValue(name).node.location.source())
+        }
+        val localNames = definitions.keys
+        val visibleNames = (localNames + outerNames).toSet()
+        val schemas = outerSchemas.toMutableMap()
+        localNames.forEach { schemas.putIfAbsent(it, ValueSchema.Any) }
+        val compiled = linkedMapOf<String, DraftCompilation>()
+        val compiling = mutableSetOf<String>()
+
+        fun draftDependencies(draft: ProducerDraft): Set<String> = when (draft) {
+            is ProducerDraft.Expression -> dependencies(draft.value).toSet()
+            is ProducerDraft.Provider -> dependencies(draft.value.input).toSet() + dependencies(draft.value.config)
+            is ProducerDraft.Match -> draftDependenciesFromExpression(draft.value) + draft.cases.values.flatMap { draftDependencies(it) }
+            is ProducerDraft.Map -> draftDependenciesFromExpression(draft.value) + draft.context.values.flatMap { draftDependencies(it) }
+        }
+
+        fun compileName(name: String): DraftCompilation {
+            compiled[name]?.let { return it }
+            val draft = definitions.getValue(name)
+            if (!compiling.add(name)) {
+                diagnostics += Diagnostic("dependency cycle involving '$name'", "$scopePath.$name", draft.node.location.source())
+                return DraftCompilation(
+                    producer = CompiledProducer.Expression(io.workflow.compiler.Expression.Literal(Value.Null), ProducerId("$identityPrefix/producer/$name"), ValueSchema.Any, emptyList(), draft.node.location.source()),
+                    expression = io.workflow.compiler.Expression.Literal(Value.Null),
+                    provider = null,
+                    match = null,
+                    map = null,
+                )
+            }
+            draftDependencies(draft).filter { it in localNames }.forEach(::compileName)
+            val result = compileDraft(
+                draft = draft,
+                name = name,
+                producerId = ProducerId("$identityPrefix/producer/$name"),
+                parameters = parameters,
+                schemas = schemas,
+                visibleNames = visibleNames,
+                lexicalRoots = lexicalRoots,
+                lexicalSchemas = lexicalSchemas,
+                outerNames = outerNames,
+                diagnostics = diagnostics,
+                identityPrefix = identityPrefix,
+            )
+            schemas[name] = result.producer.schema
+            compiled[name] = result
+            compiling -= name
+            return result
+        }
+
+        definitions.keys.forEach(::compileName)
+        val registers = definitions.keys.mapNotNull { name ->
+            val result = compiled[name] ?: return@mapNotNull null
+            val registerId = RegisterId("$identityPrefix/register/$name")
+            val producerId = ProducerId("$identityPrefix/producer/$name")
+            val deps = result.producer.dependencies.filter { it in visibleNames }.distinct().sorted()
+            CompiledRegister(
+                name = name,
+                registerId = registerId,
+                producerId = producerId,
+                producer = result.expression,
+                dependencies = deps,
+                schema = result.producer.schema,
+                source = result.producer.source,
+                provider = result.provider,
+                compiledProducer = result.producer,
+                match = result.match,
+                map = result.map,
+            )
+        }.sortedBy { it.name }
+        return ScopeCompilation(registers, localNames.associateWith { schemas.getValue(it) })
+    }
+
+    private fun compileDraft(
+        draft: ProducerDraft,
+        name: String,
+        producerId: ProducerId,
+        parameters: Map<String, ValueSchema>,
+        schemas: Map<String, ValueSchema>,
+        visibleNames: Set<String>,
+        lexicalRoots: Set<String>,
+        lexicalSchemas: Map<String, ValueSchema>,
+        outerNames: Set<String>,
+        diagnostics: MutableList<Diagnostic>,
+        identityPrefix: String,
+    ): DraftCompilation {
+        val source = draft.node.location.source()
+        val expressionSchema = { expression: io.workflow.compiler.Expression, path: String ->
+            inferExpression(expression, parameters, schemas, visibleNames, lexicalRoots, diagnostics, path, source, lexicalSchemas)
+        }
+        fun deps(expression: io.workflow.compiler.Expression): List<String> = dependencies(expression)
+            .filter { it in visibleNames }
+            .distinct()
+            .sorted()
+        fun compatible(actual: ValueSchema, expected: ValueSchema?, path: String) {
+            if (expected != null && !actual.isCompatibleWith(expected)) {
+                diagnostics += Diagnostic("expression schema ${schemaName(actual)} is incompatible with declared ${schemaName(expected)}", path, source)
+            }
+        }
+        return when (draft) {
+            is ProducerDraft.Expression -> {
+                val schema = expressionSchema(draft.value, draft.path)
+                compatible(schema, draft.explicitSchema, "${draft.path}.schema")
+                val node = CompiledProducer.Expression(draft.value, producerId, schema, deps(draft.value), source)
+                DraftCompilation(node, draft.value, null, null, null)
+            }
+            is ProducerDraft.Provider -> {
+                val descriptor = providerRegistry.resolve(draft.value.providerId, draft.value.version)?.descriptor
+                val configSchema = expressionSchema(draft.value.config, "${draft.path}.config")
+                val inputSchema = expressionSchema(draft.value.input, "${draft.path}.with")
+                if (descriptor != null) {
+                    if (!configSchema.isCompatibleWith(descriptor.configurationSchema)) diagnostics += Diagnostic(
+                        "configuration schema ${schemaName(configSchema)} is incompatible with provider configuration ${schemaName(descriptor.configurationSchema)}",
+                        "${draft.path}.config", source,
+                    )
+                    if (!inputSchema.isCompatibleWith(descriptor.inputSchema)) diagnostics += Diagnostic(
+                        "bound input schema ${schemaName(inputSchema)} is incompatible with provider input ${schemaName(descriptor.inputSchema)}",
+                        "${draft.path}.with", source,
+                    )
+                }
+                val schema = descriptor?.emissionSchema ?: ValueSchema.Any
+                compatible(schema, draft.explicitSchema, "${draft.path}.schema")
+                val node = CompiledProducer.Provider(draft.value, producerId, schema, (deps(draft.value.input) + deps(draft.value.config)).distinct().sorted(), source)
+                DraftCompilation(node, draft.value.input, draft.value, null, null)
+            }
+            is ProducerDraft.Match -> {
+                val discriminatorSchema = expressionSchema(draft.value, "${draft.path}.match.value")
+                val tagged = discriminatorSchema as? ValueSchema.TaggedUnion
+                if (tagged == null) {
+                    diagnostics += Diagnostic("match discriminator must have a tagged-union schema", "${draft.path}.match.value", source)
+                }
+                val expectedTags = tagged?.variants?.keys.orEmpty()
+                expectedTags.filterNot(draft.cases.keys::contains).forEach { tag ->
+                    diagnostics += Diagnostic("match is not exhaustive; missing case '$tag'", "${draft.path}.match.cases", source)
+                }
+                draft.cases.keys.filterNot(expectedTags::contains).forEach { tag ->
+                    diagnostics += Diagnostic("match case '$tag' is not present in discriminator schema", "${draft.path}.match.cases.$tag", draft.cases.getValue(tag).node.location.source())
+                }
+                val cases = draft.cases.toSortedMap().mapValues { (tag, caseDraft) ->
+                    compileDraft(
+                        draft = caseDraft,
+                        name = "$name/$tag",
+                        producerId = ProducerId("${producerId.value}/match/case/${stableIdSegment(tag)}"),
+                        parameters = parameters,
+                        schemas = schemas,
+                        visibleNames = visibleNames,
+                        lexicalRoots = lexicalRoots + "match",
+                        lexicalSchemas = lexicalSchemas + ("match" to (tagged?.variants?.get(tag) ?: ValueSchema.Any)),
+                        outerNames = outerNames,
+                        diagnostics = diagnostics,
+                        identityPrefix = identityPrefix,
+                    ).producer
+                }
+                val branchSchemas = cases.values.map { it.schema }.distinct()
+                val inferredSchema = when {
+                    draft.explicitSchema != null -> draft.explicitSchema
+                    branchSchemas.size == 1 -> branchSchemas.single()
+                    branchSchemas.isEmpty() -> ValueSchema.Any
+                    else -> {
+                        diagnostics += Diagnostic("match branch output schemas must be identical", "${draft.path}.match.cases", source)
+                        ValueSchema.Any
+                    }
+                }
+                if (draft.explicitSchema == null && branchSchemas.size > 1) {
+                    // The diagnostic above is intentionally emitted even when one
+                    // branch is `any`: v1 branch compatibility is canonical.
+                }
+                cases.forEach { (tag, branch) ->
+                    if (branch.schema != inferredSchema) diagnostics += Diagnostic(
+                        "match branch '$tag' output schema ${schemaName(branch.schema)} is incompatible with match output ${schemaName(inferredSchema)}",
+                        "${draft.path}.match.cases.$tag", branch.source,
+                    )
+                }
+                val outputSchema = inferredSchema
+                val match = if (tagged != null) CompiledMatch(draft.value, tagged, cases, outputSchema) else null
+                val allDeps = (deps(draft.value) + cases.values.flatMap { it.dependencies }).filter { it in visibleNames }.distinct().sorted()
+                val node = if (match != null) CompiledProducer.Match(match, producerId, outputSchema, allDeps, source)
+                else CompiledProducer.Expression(draft.value, producerId, outputSchema, allDeps, source)
+                DraftCompilation(node, draft.value, null, match, null)
+            }
+            is ProducerDraft.Map -> {
+                val inputSchema = expressionSchema(draft.value, "${draft.path}.map.over")
+                val ordering = when (inputSchema) {
+                    is ValueSchema.Array -> MapResultOrdering.ARRAY_INDEX
+                    is ValueSchema.Object -> MapResultOrdering.OBJECT_KEY
+                    else -> {
+                        diagnostics += Diagnostic("map input must have a finite array or object schema", "${draft.path}.map.over", source)
+                        MapResultOrdering.ARRAY_INDEX
+                    }
+                }
+                val bodyScope = compileScope(
+                    definitions = draft.context,
+                    scopePath = "${draft.path}.map.context",
+                    identityPrefix = "${producerId.value}/map",
+                    parameters = parameters,
+                    outerSchemas = schemas.filterKeys { it in visibleNames },
+                    outerNames = visibleNames,
+                    lexicalRoots = setOf("item", "key"),
+                    lexicalSchemas = mapOf(
+                        "item" to when (inputSchema) {
+                            is ValueSchema.Array -> inputSchema.items
+                            is ValueSchema.Object -> inputSchema.fields.values.map { it.schema }.distinct().singleOrNull() ?: ValueSchema.Any
+                            else -> ValueSchema.Any
+                        },
+                        "key" to when (inputSchema) {
+                            is ValueSchema.Array -> ValueSchema.Integer
+                            is ValueSchema.Object -> ValueSchema.String
+                            else -> ValueSchema.Any
+                        },
+                    ),
+                    forbiddenNames = visibleNames,
+                    diagnostics = diagnostics,
+                )
+                val output = draft.output
+                val selected = output?.let { bodyScope.registers.firstOrNull { register -> register.name == it } }
+                if (output == null) {
+                    // parseMap already emitted the source-located missing-field diagnostic.
+                } else if (selected == null) {
+                    diagnostics += Diagnostic("map output '$output' is not defined in nested context", "${draft.path}.map.output", source)
+                }
+                val itemSchema = selected?.schema ?: ValueSchema.Any
+                val resultSchema = when (inputSchema) {
+                    is ValueSchema.Array -> ValueSchema.Array(itemSchema)
+                    is ValueSchema.Object -> ValueSchema.Object(
+                        inputSchema.fields.mapValues { (_, field) -> ValueSchema.Object.Field(itemSchema, field.required) },
+                        inputSchema.additionalFields,
+                    )
+                    else -> ValueSchema.Any
+                }
+                compatible(resultSchema, draft.explicitSchema, "${draft.path}.schema")
+                val map = if (output != null && selected != null) CompiledMap(draft.value, bodyScope.registers, output, itemSchema, ordering) else null
+                val bodyDependencies = bodyScope.registers.flatMap { it.dependencies }.filter { it in visibleNames }
+                val allDeps = (deps(draft.value) + bodyDependencies).filter { it in visibleNames }.distinct().sorted()
+                val node = if (map != null) CompiledProducer.Map(map, producerId, resultSchema, allDeps, source)
+                else CompiledProducer.Expression(draft.value, producerId, resultSchema, allDeps, source)
+                DraftCompilation(node, draft.value, null, null, map)
+            }
+        }
+    }
+
+    private fun draftDependenciesFromExpression(expression: io.workflow.compiler.Expression): Set<String> = dependencies(expression).toSet()
+
+    private fun stableIdSegment(value: String): String = value
+        .replace("%", "%25")
+        .replace("/", "%2F")
 
     private fun parseParameters(node: YamlNode?, diagnostics: MutableList<Diagnostic>): Map<String, ValueSchema> {
         val map = node as? YamlMap ?: return if (node == null) emptyMap() else run { diagnostics += Diagnostic("parameters must be a mapping", "$.workflow.parameters", node.location.source()); emptyMap() }
@@ -555,44 +966,44 @@ class WorkflowCompiler(
         return schemaNode?.let { parseSchema(it, path, diagnostics) }
     }
 
-    private fun inferExpression(expression: Expression, parameters: Map<String, ValueSchema>, inferred: Map<String, ValueSchema>, registers: Set<String>, lexical: Set<String>, diagnostics: MutableList<Diagnostic>, path: String, source: SourceLocation): ValueSchema = when (expression) {
+    private fun inferExpression(expression: Expression, parameters: Map<String, ValueSchema>, inferred: Map<String, ValueSchema>, registers: Set<String>, lexical: Set<String>, diagnostics: MutableList<Diagnostic>, path: String, source: SourceLocation, lexicalSchemas: Map<String, ValueSchema> = emptyMap()): ValueSchema = when (expression) {
         is Expression.Literal -> valueSchema(expression.value)
         is Expression.Ref -> {
             val rootSchema = when {
                 expression.root == "parameters" -> ValueSchema.Object(parameters.mapValues { ValueSchema.Object.Field(it.value) })
                 expression.root in registers -> inferred[expression.root] ?: ValueSchema.Any
-                expression.root in lexical -> ValueSchema.Any
+                expression.root in lexical -> lexicalSchemas[expression.root] ?: ValueSchema.Any
                 else -> { diagnostics += Diagnostic("unknown reference root '${expression.root}'", path, source); ValueSchema.Any }
             }
             pathSchema(rootSchema, expression.path, path, diagnostics, source)
         }
-        is Expression.ObjectValue -> ValueSchema.Object(expression.fields.mapValues { ValueSchema.Object.Field(inferExpression(it.value, parameters, inferred, registers, lexical, diagnostics, path, source)) })
+        is Expression.ObjectValue -> ValueSchema.Object(expression.fields.mapValues { ValueSchema.Object.Field(inferExpression(it.value, parameters, inferred, registers, lexical, diagnostics, path, source, lexicalSchemas)) })
         is Expression.ArrayValue -> {
-            val schemas = expression.items.map { inferExpression(it, parameters, inferred, registers, lexical, diagnostics, path, source) }
+            val schemas = expression.items.map { inferExpression(it, parameters, inferred, registers, lexical, diagnostics, path, source, lexicalSchemas) }
             ValueSchema.Array(schemas.distinct().singleOrNull() ?: ValueSchema.Any)
         }
         is Expression.Concat -> {
             expression.parts.forEach { part ->
-                val partSchema = inferExpression(part, parameters, inferred, registers, lexical, diagnostics, path, source)
+                val partSchema = inferExpression(part, parameters, inferred, registers, lexical, diagnostics, path, source, lexicalSchemas)
                 if (partSchema != ValueSchema.String) diagnostics += Diagnostic("\$concat operands must have string schemas", path, source)
             }
             ValueSchema.String
         }
         is Expression.Equals -> {
-            inferExpression(expression.left, parameters, inferred, registers, lexical, diagnostics, path, source)
-            inferExpression(expression.right, parameters, inferred, registers, lexical, diagnostics, path, source)
+            inferExpression(expression.left, parameters, inferred, registers, lexical, diagnostics, path, source, lexicalSchemas)
+            inferExpression(expression.right, parameters, inferred, registers, lexical, diagnostics, path, source, lexicalSchemas)
             ValueSchema.Boolean
         }
         is Expression.Present -> {
-            inferExpression(expression.value, parameters, inferred, registers, lexical, diagnostics, path, source)
+            inferExpression(expression.value, parameters, inferred, registers, lexical, diagnostics, path, source, lexicalSchemas)
             if (expression.value !is Expression.Ref || expression.value.requirement != Requirement.OPTIONAL) {
                 diagnostics += Diagnostic("\$present requires an optional reference", path, source)
             }
             ValueSchema.Boolean
         }
-        is Expression.And -> { expression.predicates.forEach { requireBoolean(it, parameters, inferred, registers, lexical, diagnostics, path, source, "\$and") }; ValueSchema.Boolean }
-        is Expression.Or -> { expression.predicates.forEach { requireBoolean(it, parameters, inferred, registers, lexical, diagnostics, path, source, "\$or") }; ValueSchema.Boolean }
-        is Expression.Not -> { requireBoolean(expression.predicate, parameters, inferred, registers, lexical, diagnostics, path, source, "\$not"); ValueSchema.Boolean }
+        is Expression.And -> { expression.predicates.forEach { requireBoolean(it, parameters, inferred, registers, lexical, diagnostics, path, source, "\$and", lexicalSchemas) }; ValueSchema.Boolean }
+        is Expression.Or -> { expression.predicates.forEach { requireBoolean(it, parameters, inferred, registers, lexical, diagnostics, path, source, "\$or", lexicalSchemas) }; ValueSchema.Boolean }
+        is Expression.Not -> { requireBoolean(expression.predicate, parameters, inferred, registers, lexical, diagnostics, path, source, "\$not", lexicalSchemas); ValueSchema.Boolean }
     }
 
     private fun pathSchema(start: ValueSchema, pathSteps: List<PathStep>, path: String, diagnostics: MutableList<Diagnostic>, source: SourceLocation): ValueSchema {
@@ -752,8 +1163,8 @@ class WorkflowCompiler(
         return ValueSchema.TaggedUnion(discriminator, variants)
     }
 
-    private fun requireBoolean(expression: Expression, parameters: Map<String, ValueSchema>, inferred: Map<String, ValueSchema>, registers: Set<String>, lexical: Set<String>, diagnostics: MutableList<Diagnostic>, path: String, source: SourceLocation, operator: String) {
-        val schema = inferExpression(expression, parameters, inferred, registers, lexical, diagnostics, path, source)
+    private fun requireBoolean(expression: Expression, parameters: Map<String, ValueSchema>, inferred: Map<String, ValueSchema>, registers: Set<String>, lexical: Set<String>, diagnostics: MutableList<Diagnostic>, path: String, source: SourceLocation, operator: String, lexicalSchemas: Map<String, ValueSchema> = emptyMap()) {
+        val schema = inferExpression(expression, parameters, inferred, registers, lexical, diagnostics, path, source, lexicalSchemas)
         if (schema != ValueSchema.Boolean) diagnostics += Diagnostic("$operator operands must have boolean schemas", path, source)
     }
     private fun stringScalar(map: YamlMap, key: String, path: String, diagnostics: MutableList<Diagnostic>): String? {
@@ -855,9 +1266,52 @@ private object CanonicalIrJson {
                 "policy" to jsonValue(provider.policy),
             ))
         }
+        register.match?.let { fields["match"] = match(it) }
+        register.map?.let { fields["map"] = map(it) }
         if (includeSource) fields["source"] = JsonObject(mapOf("line" to JsonPrimitive(register.source.line), "column" to JsonPrimitive(register.source.column)))
         return JsonObject(fields.toSortedMap())
     }
+
+    private fun compiledProducer(producer: CompiledProducer): JsonElement {
+        val fields = linkedMapOf<String, JsonElement>(
+            "producerId" to JsonPrimitive(producer.producerId.value),
+            "schema" to schema(producer.schema),
+            "dependencies" to JsonArray(producer.dependencies.sorted().map(::JsonPrimitive)),
+        )
+        when (producer) {
+            is CompiledProducer.Expression -> { fields["kind"] = JsonPrimitive("expression"); fields["expression"] = expression(producer.value) }
+            is CompiledProducer.Provider -> { fields["kind"] = JsonPrimitive("provider"); fields["provider"] = provider(producer.value) }
+            is CompiledProducer.Match -> { fields["kind"] = JsonPrimitive("match"); fields["match"] = match(producer.value) }
+            is CompiledProducer.Map -> { fields["kind"] = JsonPrimitive("map"); fields["map"] = map(producer.value) }
+        }
+        return JsonObject(fields.toSortedMap())
+    }
+
+    private fun provider(provider: CompiledProvider): JsonElement = JsonObject(linkedMapOf(
+        "providerId" to JsonPrimitive(provider.providerId),
+        "version" to JsonPrimitive(provider.version),
+        "config" to expression(provider.config),
+        "input" to expression(provider.input),
+        "capabilities" to JsonArray(provider.capabilities.sorted().map(::JsonPrimitive)),
+        "policy" to jsonValue(provider.policy),
+    ).toSortedMap())
+
+    private fun match(match: CompiledMatch): JsonElement = JsonObject(linkedMapOf(
+        "kind" to JsonPrimitive("match"),
+        "discriminator" to expression(match.discriminator),
+        "discriminatorSchema" to schema(match.discriminatorSchema),
+        "cases" to JsonObject(match.cases.toSortedMap().mapValues { compiledProducer(it.value) }),
+        "outputSchema" to schema(match.outputSchema),
+    ).toSortedMap())
+
+    private fun map(map: CompiledMap): JsonElement = JsonObject(linkedMapOf(
+        "kind" to JsonPrimitive("map"),
+        "input" to expression(map.input),
+        "context" to JsonArray(map.context.sortedBy { it.name }.map { register(it, includeSource = false) }),
+        "output" to JsonPrimitive(map.output),
+        "outputSchema" to schema(map.outputSchema),
+        "ordering" to JsonPrimitive(map.ordering.name.lowercase()),
+    ).toSortedMap())
     private fun expression(expression: Expression): JsonElement = when (expression) {
         is Expression.Literal -> JsonObject(mapOf("kind" to JsonPrimitive("literal"), "value" to jsonValue(expression.value)))
         is Expression.Ref -> JsonObject(mapOf(
