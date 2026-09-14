@@ -7,14 +7,16 @@ import io.workflow.runtime.InMemoryWorkflowRunner
 import io.workflow.runtime.SqliteJournalStore
 import io.workflow.runtime.WorkflowReplay
 import io.workflow.core.ExecutionId
+import io.workflow.core.EmissionId
 import io.workflow.runtime.WorkflowExecutionException
 import io.workflow.demo.DemoProviders
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.UUID
 
 fun main(args: Array<String>) {
     if (args.isEmpty() || args.first() == "--help") {
-        println("No command was given. Use validate, compile, run, inspect, stop, resume, or replay.")
+        println("No command was given. Use validate, compile, run, inspect, stop, resume, replay, or demo.")
         return
     }
     when (args.first()) {
@@ -47,10 +49,76 @@ fun main(args: Array<String>) {
         )
         "resume" -> resumeDatabase(args)
         "replay" -> replayDatabase(args)
+        "demo" -> continuousRepositoryDemo(args)
         else -> {
-            System.err.println("unknown command '${args.first()}'; use validate, compile, run, inspect, stop, resume, or replay")
+            System.err.println("unknown command '${args.first()}'; use validate, compile, run, inspect, stop, resume, replay, or demo")
             kotlin.system.exitProcess(2)
         }
+    }
+}
+
+/**
+ * Offline administration surface for the v0.4 durable repository example.
+ * The provider itself is an open durable source; this command only supplies
+ * explicit fixture emissions and never needs a webhook server.
+ */
+private fun continuousRepositoryDemo(args: Array<String>) {
+    if (args.getOrNull(1) != "continuous-repositories") {
+        System.err.println("demo requires 'continuous-repositories'")
+        kotlin.system.exitProcess(2)
+    }
+    val action = args.getOrNull(2)?.takeUnless { it.startsWith("--") } ?: "start"
+    if (action !in setOf("start", "resume", "emit", "inspect", "stop")) {
+        System.err.println("continuous-repositories actions: start, resume, emit, inspect, stop")
+        kotlin.system.exitProcess(2)
+    }
+    val databaseIndex = args.indexOf("--database")
+    if (databaseIndex < 0 || databaseIndex + 1 >= args.size) {
+        System.err.println("continuous-repositories requires --database <sqlite path>")
+        kotlin.system.exitProcess(2)
+    }
+    val database = Path.of(args[databaseIndex + 1])
+    val execution = args.indexOf("--execution").takeIf { it >= 0 }?.let { index ->
+        require(index + 1 < args.size) { "--execution requires an execution id" }
+        ExecutionId(args[index + 1])
+    } ?: ExecutionId("continuous-repositories")
+    val providers = DemoProviders.registry()
+    val compiler = WorkflowCompiler(providerRegistry = providers)
+    val yamlPath = Path.of("examples", "continuous-repositories.yaml")
+    val workflow = compiler.compile(Files.readString(yamlPath)).ir
+        ?: error("continuous repository demo workflow did not compile")
+    try {
+        SqliteJournalStore(database).use { store ->
+            val runner = InMemoryWorkflowRunner(compiler = compiler, journal = store, providerRegistry = providers)
+            val host = if (store.executionBinding(execution) == null) {
+                runner.start(workflow, executionId = execution)
+            } else {
+                runner.resume(execution)
+            }
+            when (action) {
+                "emit" -> {
+                    val eventIndex = args.indexOf("--event")
+                    require(eventIndex >= 0 && eventIndex + 1 < args.size) {
+                        "emit requires --event <json containing repository, branch, deliveryId, commit>"
+                    }
+                    val event = CanonicalValueJson.decode(args[eventIndex + 1]) as? Value.ObjectValue
+                        ?: throw WorkflowExecutionException("event JSON must be an object")
+                    val deliveryId = (event.fields["deliveryId"] as? Value.StringValue)?.value
+                        ?: throw WorkflowExecutionException("event.deliveryId must be a string")
+                    val handle = host.openProviders().singleOrNull { it.providerId == DemoProviders.COMMIT_EVENTS }
+                        ?: throw WorkflowExecutionException("continuous commit-event source is not open")
+                    host.emit(handle.invocationId, event, EmissionId("event-$deliveryId-${UUID.randomUUID()}"))
+                }
+                "stop" -> host.stop()
+                else -> host.result()
+            }
+            // The runtime's canonical inspection is stable JSON and includes assignment,
+            // activation, dependency-vector, and provider-event provenance.
+            println(host.result().inspectionJson())
+        }
+    } catch (failure: Exception) {
+        System.err.println("continuous repository demo failed: ${failure.message ?: "error"}")
+        kotlin.system.exitProcess(1)
     }
 }
 
