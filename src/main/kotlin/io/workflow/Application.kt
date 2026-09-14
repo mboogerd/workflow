@@ -55,7 +55,19 @@ private fun compileFile(args: Array<String>) = run {
         System.err.println("YAML file not found: $path")
         kotlin.system.exitProcess(2)
     }
-    WorkflowCompiler().compile(Files.readString(path))
+    WorkflowCompiler(providerRegistry = providerRegistry(args)).compile(Files.readString(path))
+}
+
+private fun providerRegistry(args: Array<String>): io.workflow.provider.ProviderRegistry {
+    val providerIndex = args.indexOf("--providers")
+    if (providerIndex < 0 || providerIndex + 1 >= args.size) return io.workflow.provider.ProviderRegistry.empty()
+    return when (args[providerIndex + 1]) {
+        "demo" -> DemoProviders.registry()
+        else -> {
+            System.err.println("unknown provider profile '${args[providerIndex + 1]}'")
+            kotlin.system.exitProcess(2)
+        }
+    }
 }
 
 private fun runFile(args: Array<String>, inspectionOnly: Boolean) {
@@ -68,18 +80,7 @@ private fun runFile(args: Array<String>, inspectionOnly: Boolean) {
         System.err.println("YAML file not found: $yamlPath")
         kotlin.system.exitProcess(2)
     }
-    val providerIndex = args.indexOf("--providers")
-    val providers = if (providerIndex >= 0 && providerIndex + 1 < args.size) {
-        when (args[providerIndex + 1]) {
-            "demo" -> DemoProviders.registry()
-            else -> {
-                System.err.println("unknown provider profile '${args[providerIndex + 1]}'")
-                kotlin.system.exitProcess(2)
-            }
-        }
-    } else {
-        io.workflow.provider.ProviderRegistry.empty()
-    }
+    val providers = providerRegistry(args)
     val parameterIndex = args.indexOf("--parameters")
     if (parameterIndex < 0 || parameterIndex + 1 >= args.size) {
         System.err.println("${args.first()} requires --parameters <json>")
