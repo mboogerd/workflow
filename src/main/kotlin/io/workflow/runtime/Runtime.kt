@@ -29,8 +29,19 @@ import io.workflow.core.WorkflowId
 import io.workflow.core.WorkflowVersionId
 import io.workflow.core.CanonicalValueJson
 import io.workflow.core.validate
+import io.workflow.provider.ProviderInvocationRequest
+import io.workflow.provider.ProviderLifecycleMessage
+import io.workflow.provider.ProviderRegistry
 import java.security.MessageDigest
 import java.time.Instant
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.joinAll
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -66,9 +77,60 @@ data class ActivationRecord(
     val startedAt: Instant,
     val completedAt: Instant?,
     val failure: String? = null,
+    val invocationId: InvocationId? = null,
+    val attemptId: AttemptId? = null,
 ) {
-    enum class Status { COMPLETED, FAILED }
+    enum class Status { COMPLETED, OPEN, FAILED }
 }
+
+/** The append-only provider lifecycle records emitted by the activation boundary. */
+enum class ProviderEventType {
+    INVOCATION,
+    ATTEMPT_STARTED,
+    EMISSION_RECEIVED,
+    EMISSION_ACCEPTED,
+    EMISSION_REFUSED,
+    COMPLETED,
+    OPEN,
+    FAILED;
+
+    companion object {
+        // Compatibility names for consumers that use the full lifecycle wording.
+        val INVOCATION_STARTED: ProviderEventType get() = INVOCATION
+        val ATTEMPT_START: ProviderEventType get() = ATTEMPT_STARTED
+        val EMISSION_REJECTED: ProviderEventType get() = EMISSION_REFUSED
+    }
+}
+
+data class ProviderLifecycleEvent(
+    val eventId: String,
+    val type: ProviderEventType,
+    val workflowId: WorkflowId,
+    val workflowVersionId: WorkflowVersionId,
+    val executionId: ExecutionId,
+    val contextId: ContextId,
+    val producerId: ProducerId,
+    val activationId: ActivationId,
+    val intentId: ActivationIntentId,
+    val invocationId: InvocationId,
+    val attemptId: AttemptId? = null,
+    val emissionId: EmissionId? = null,
+    val causationId: String? = null,
+    val value: Value? = null,
+    val error: Value? = null,
+    val diagnostic: String? = null,
+    val correlationId: String? = null,
+    val occurredAt: Instant,
+    val providerId: String? = null,
+    val providerVersion: Int? = null,
+) {
+    /** `kind` is a convenient protocol-facing name for inspection clients. */
+    val kind: ProviderEventType get() = type
+    val eventType: ProviderEventType get() = type
+    val safeDiagnostics: String? get() = diagnostic
+}
+
+typealias ProviderJournalEvent = ProviderLifecycleEvent
 
 /** The result made available by the output publication boundary. */
 data class PublishedOutput(val value: Value, val revision: Long)
@@ -128,7 +190,11 @@ class InMemoryJournalStore(
     private val currentAssignments = linkedMapOf<RegisterKey, AssignmentMutation>()
     private val activationIntents = linkedMapOf<ActivationIntentId, ActivationIntent>()
     private val completedIntentIds = linkedSetOf<ActivationIntentId>()
+    private val claimedIntentIds = linkedSetOf<ActivationIntentId>()
+    private val openIntentIds = linkedSetOf<ActivationIntentId>()
     private val activationRecords = mutableListOf<ActivationRecord>()
+    private val providerEvents = mutableListOf<ProviderLifecycleEvent>()
+    private val providerEventIds = mutableSetOf<String>()
     private val assignmentsById = linkedMapOf<AssignmentId, AssignmentMutation>()
     private val executionBindings = linkedMapOf<ExecutionId, ExecutionBinding>()
 
@@ -262,17 +328,66 @@ class InMemoryJournalStore(
     fun assignments(): List<AssignmentMutation> = synchronized(lock) { journalBatches.map { it.assignment } }
     fun activationIntents(): List<ActivationIntent> = synchronized(lock) { activationIntents.values.toList() }
     fun activations(): List<ActivationRecord> = synchronized(lock) { activationRecords.toList() }
+    fun providerEvents(): List<ProviderLifecycleEvent> = synchronized(lock) { providerEvents.toList() }
+    fun events(): List<ProviderLifecycleEvent> = providerEvents()
+    fun providerLifecycleEvents(): List<ProviderLifecycleEvent> = providerEvents()
+    fun providerInvocations(): List<ProviderLifecycleEvent> = providerEvents().filter { it.type == ProviderEventType.INVOCATION }
+    fun providerAttempts(): List<ProviderLifecycleEvent> = providerEvents().filter { it.type == ProviderEventType.ATTEMPT_STARTED }
+    fun providerEmissions(): List<ProviderLifecycleEvent> = providerEvents().filter {
+        it.type == ProviderEventType.EMISSION_RECEIVED ||
+            it.type == ProviderEventType.EMISSION_ACCEPTED ||
+            it.type == ProviderEventType.EMISSION_REFUSED
+    }
+    fun providerFailures(): List<ProviderLifecycleEvent> = providerEvents().filter { it.type == ProviderEventType.FAILED }
+    fun invocationRecords(): List<ProviderLifecycleEvent> = providerInvocations()
+    fun attemptRecords(): List<ProviderLifecycleEvent> = providerAttempts()
+    fun emissionRecords(): List<ProviderLifecycleEvent> = providerEmissions()
+    fun failureRecords(): List<ProviderLifecycleEvent> = providerFailures()
     fun assignment(id: AssignmentId): AssignmentMutation? = synchronized(lock) { assignmentsById[id] }
 
-    /** Claiming does not delete or acknowledge an intent; only completion does. */
+    fun recordProviderEvent(event: ProviderLifecycleEvent) = synchronized(lock) {
+        require(providerEventIds.add(event.eventId)) { "provider event id is already committed" }
+        providerEvents += event
+    }
+
+    /** Claiming reserves an intent; completion acknowledges it durably. */
     override fun claimNextActivation(executionId: ExecutionId): ActivationIntent? = synchronized(lock) {
-        activationIntents.values.firstOrNull { it.executionId == executionId && it.id !in completedIntentIds }
+        activationIntents.values.firstOrNull {
+            it.executionId == executionId &&
+                it.id !in completedIntentIds &&
+                it.id !in claimedIntentIds &&
+                it.id !in openIntentIds
+        }?.also { claimedIntentIds += it.id }
     }
 
     override fun completeActivation(intentId: ActivationIntentId) = synchronized(lock) {
         require(intentId in activationIntents) { "cannot complete an unknown activation intent" }
+        claimedIntentIds -= intentId
+        openIntentIds -= intentId
         completedIntentIds += intentId
     }
+
+    /** Return an in-flight claim to the durable queue after an unhandled worker error. */
+    fun releaseActivation(intentId: ActivationIntentId) = synchronized(lock) {
+        require(intentId in activationIntents) { "cannot release an unknown activation intent" }
+        claimedIntentIds -= intentId
+    }
+
+    /** Park an open activation until a future stream-driving API resumes it. */
+    fun keepActivationOpen(intentId: ActivationIntentId) = synchronized(lock) {
+        require(intentId in activationIntents) { "cannot keep an unknown activation intent open" }
+        require(intentId !in completedIntentIds) { "cannot reopen a completed activation intent" }
+        claimedIntentIds -= intentId
+        openIntentIds += intentId
+    }
+
+    fun hasPendingActivations(executionId: ExecutionId): Boolean = synchronized(lock) {
+        activationIntents.values.any {
+            it.executionId == executionId && it.id !in completedIntentIds && it.id !in openIntentIds
+        }
+    }
+
+    fun isOpen(intentId: ActivationIntentId): Boolean = synchronized(lock) { intentId in openIntentIds }
 
     fun recordActivation(record: ActivationRecord) = synchronized(lock) {
         val intent = activationIntents[record.intentId]
@@ -460,6 +575,8 @@ data class WorkflowRunResult(
     val failures: List<String> = emptyList(),
 ) {
     val isSuccessful: Boolean get() = failures.isEmpty()
+    val providerEvents: List<ProviderLifecycleEvent>
+        get() = journal.providerEvents().filter { it.executionId == executionId }
 
     fun outputsJson(): String {
         val outputObject = outputs.toSortedMap().mapValues { (_, output) ->
@@ -490,16 +607,41 @@ class InMemoryWorkflowRunner(
     private val idSource: IdSource = UuidIdSource(),
     val journal: InMemoryJournalStore = InMemoryJournalStore(clock, idSource),
     private val planner: ActivationPlanner = ExpressionActivationPlanner(),
+    private val providerRegistry: ProviderRegistry = compiler.providerRegistry,
+    private val workerCount: Int = DEFAULT_WORKER_COUNT,
 ) {
+    private val assignmentCommitLock = Any()
+
+    constructor(providerRegistry: ProviderRegistry) : this(
+        compiler = WorkflowCompiler(providerRegistry),
+        providerRegistry = providerRegistry,
+    )
+
+    constructor(providerRegistry: ProviderRegistry, workerCount: Int) : this(
+        compiler = WorkflowCompiler(providerRegistry),
+        providerRegistry = providerRegistry,
+        workerCount = workerCount,
+    )
+
+    init {
+        require(workerCount > 0) { "provider worker count must be positive" }
+    }
+
     fun run(
         yamlText: String,
         parameters: Map<String, Value> = emptyMap(),
         executionId: ExecutionId = nextExecutionId(),
         beforeActivation: (ActivationIntent) -> Unit = {},
     ): WorkflowRunResult {
-        val compilation = compiler.compile(yamlText)
+        val compilation = compile(yamlText)
         if (!compilation.isValid) throw WorkflowExecutionException(compilation.diagnostics.joinToString("\n"))
         return execute(compilation.ir!!, parameters, executionId, beforeActivation)
+    }
+
+    private fun compile(yamlText: String) = if (providerRegistry !== compiler.providerRegistry && compiler.providerRegistry.isEmpty()) {
+        WorkflowCompiler(providerRegistry).compile(yamlText)
+    } else {
+        compiler.compile(yamlText)
     }
 
     fun execute(
@@ -521,101 +663,704 @@ class InMemoryWorkflowRunner(
         )
 
         val failures = mutableListOf<String>()
-        while (true) {
-            val intent = journal.claimNextActivation(executionId) ?: break
-            val register = workflow.registers.firstOrNull { it.producerId == intent.producerId }
-                ?: throw WorkflowExecutionException("activation refers to unknown producer ${intent.producerId.value}")
-            val started = clock.now()
-            // The hook is deliberately before any acknowledgement. If it throws,
-            // the persisted intent remains available for a later worker.
-            beforeActivation(intent)
-            try {
-                val context = capturedContext(intent)
-                val evaluated = evaluate(register.producer, workflow, boundParameters, context)
-                val value = materialize(evaluated)
-                if (evaluated !is Evaluated.OptionalResult) {
-                    val validation = register.schema.validate(value)
-                    if (!validation.isValid) throw BindingFailure(validation.errors.joinToString { "${it.path}: ${it.message}" })
-                }
-                val assignmentId = AssignmentId("assignment-${idSource.nextId()}")
-                val batchId = JournalBatchId("batch-${idSource.nextId()}")
-                val candidate = AssignmentMutation(
-                    assignmentId = assignmentId,
-                    workflowId = WorkflowId(workflow.workflowId),
-                    workflowVersionId = workflow.workflowVersionId,
-                    executionId = executionId,
-                    contextId = intent.contextId,
-                    registerId = register.registerId,
-                    value = value,
-                    producerId = register.producerId,
-                    activationId = intent.activationId,
-                    dependencyRevisions = intent.dependencyRevisions,
-                    causationId = intent.id.value,
-                    occurredAt = clock.now(),
-                    mutationOrdinal = 0,
-                )
-                val currentWithCandidate = journal.allCurrent() +
-                    (RegisterKey(executionId, intent.contextId, register.registerId) to candidate)
-                val downstream = planner.afterAssignment(
-                    workflow,
-                    executionId,
-                    intent.contextId,
-                    candidate,
-                    currentWithCandidate,
-                    batchId,
-                    clock.now(),
-                )
-                journal.commit(
-                    JournalBatch(batchId, listOf(candidate), clock.now()),
-                    downstream,
-                )
-                journal.recordActivation(
-                    ActivationRecord(
-                        activationId = intent.activationId,
-                        intentId = intent.id,
-                        workflowId = intent.workflowId,
-                        workflowVersionId = intent.workflowVersionId,
-                        executionId = intent.executionId,
-                        producerId = intent.producerId,
-                        contextId = intent.contextId,
-                        dependencyRevisions = intent.dependencyRevisions,
-                        status = ActivationRecord.Status.COMPLETED,
-                        startedAt = started,
-                        completedAt = clock.now(),
-                    ),
-                )
-                journal.completeActivation(intent.id)
-            } catch (failure: BindingFailure) {
-                journal.recordActivation(
-                    ActivationRecord(
-                        activationId = intent.activationId,
-                        intentId = intent.id,
-                        workflowId = intent.workflowId,
-                        workflowVersionId = intent.workflowVersionId,
-                        executionId = intent.executionId,
-                        producerId = intent.producerId,
-                        contextId = intent.contextId,
-                        dependencyRevisions = intent.dependencyRevisions,
-                        status = ActivationRecord.Status.FAILED,
-                        startedAt = started,
-                        completedAt = clock.now(),
-                        failure = failure.message,
-                    ),
-                )
-                journal.completeActivation(intent.id)
-                failures += "${register.name}: ${failure.message}"
-            }
-        }
+        runWorkers(workflow, boundParameters, executionId, beforeActivation, failures)
 
         val outputs = workflow.outputs.mapNotNull { outputName ->
             val register = workflow.registers.first { it.name == outputName }
             val assignment = journal.current(RegisterKey(executionId, contextId, register.registerId))
-            if (assignment == null && failures.isEmpty()) {
+            if (assignment == null && failures.isEmpty() && register.provider == null) {
                 throw WorkflowExecutionException("output '$outputName' received no assignment")
             }
             assignment?.let { outputName to PublishedOutput(it.value, it.revision) }
         }.toMap()
         return WorkflowRunResult(executionId, outputs, journal, failures)
+    }
+
+    /** Run ready activations on a bounded coroutine dispatcher until the queue quiesces. */
+    private fun runWorkers(
+        workflow: WorkflowIrDocument,
+        parameters: Map<String, Value>,
+        executionId: ExecutionId,
+        beforeActivation: (ActivationIntent) -> Unit,
+        failures: MutableList<String>,
+    ) {
+        val executor = Executors.newFixedThreadPool(workerCount)
+        val dispatcher = executor.asCoroutineDispatcher()
+        try {
+            runBlocking {
+                withContext(dispatcher) {
+                    val active = AtomicInteger(0)
+                    val workers = List(workerCount) {
+                        launch {
+                            workerLoop(workflow, parameters, executionId, beforeActivation, failures, active)
+                        }
+                    }
+                    workers.joinAll()
+                }
+            }
+        } finally {
+            dispatcher.close()
+            executor.shutdownNow()
+        }
+    }
+
+    private suspend fun workerLoop(
+        workflow: WorkflowIrDocument,
+        parameters: Map<String, Value>,
+        executionId: ExecutionId,
+        beforeActivation: (ActivationIntent) -> Unit,
+        failures: MutableList<String>,
+        active: AtomicInteger,
+    ) {
+        while (true) {
+            val intent = journal.claimNextActivation(executionId)
+            if (intent == null) {
+                if (active.get() == 0 && !journal.hasPendingActivations(executionId)) return
+                yield()
+                continue
+            }
+            active.incrementAndGet()
+            try {
+                // Keep this hook outside activation failure handling. Its existing
+                // contract is a worker-crash simulation and must leave the claim retryable.
+                try {
+                    beforeActivation(intent)
+                } catch (failure: Throwable) {
+                    journal.releaseActivation(intent.id)
+                    throw failure
+                }
+                processActivation(workflow, parameters, intent)?.let { failure ->
+                    synchronized(failures) { failures += failure }
+                }
+            } finally {
+                active.decrementAndGet()
+            }
+        }
+    }
+
+    private fun processActivation(
+        workflow: WorkflowIrDocument,
+        parameters: Map<String, Value>,
+        intent: ActivationIntent,
+    ): String? {
+        val register = workflow.registers.firstOrNull { it.producerId == intent.producerId }
+            ?: throw WorkflowExecutionException("activation refers to unknown producer ${intent.producerId.value}")
+        val started = clock.now()
+        return try {
+            val context = capturedContext(intent)
+            if (register.provider == null) {
+                val evaluated = evaluate(register.producer, workflow, parameters, context)
+                val value = materialize(evaluated)
+                if (evaluated !is Evaluated.OptionalResult) validateOutput(register, value)
+                commitAssignment(
+                    workflow = workflow,
+                    intent = intent,
+                    register = register,
+                    value = value,
+                    invocationId = null,
+                    emissionId = null,
+                    causationId = intent.id.value,
+                    contextId = intent.contextId,
+                )
+                recordActivation(intent, ActivationRecord.Status.COMPLETED, started, null, null, null)
+                journal.completeActivation(intent.id)
+                null
+            } else {
+                val result = executeProvider(workflow, parameters, context, intent, register)
+                val status = if (result.failure != null) ActivationRecord.Status.FAILED else when (result.status) {
+                    ProviderActivationStatus.COMPLETED -> ActivationRecord.Status.COMPLETED
+                    ProviderActivationStatus.OPEN -> ActivationRecord.Status.OPEN
+                }
+                recordActivation(intent, status, started, result.failure, result.invocationId, result.attemptId)
+                if (status == ActivationRecord.Status.OPEN) journal.keepActivationOpen(intent.id)
+                else journal.completeActivation(intent.id)
+                result.failure?.let { "${register.name}: $it" }
+            }
+        } catch (failure: BindingFailure) {
+            recordActivation(intent, ActivationRecord.Status.FAILED, started, failure.message, null, null)
+            journal.completeActivation(intent.id)
+            "${register.name}: ${failure.message}"
+        }
+    }
+
+    private enum class ProviderActivationStatus { COMPLETED, OPEN }
+
+    private data class ProviderExecutionResult(
+        val status: ProviderActivationStatus,
+        val invocationId: InvocationId,
+        val attemptId: AttemptId?,
+        val failure: String? = null,
+    )
+
+    private fun executeProvider(
+        workflow: WorkflowIrDocument,
+        parameters: Map<String, Value>,
+        context: Map<RegisterId, AssignmentMutation>,
+        intent: ActivationIntent,
+        register: CompiledRegister,
+    ): ProviderExecutionResult {
+        val binding = register.provider ?: error("provider binding is missing")
+        val registration = providerRegistry.resolve(binding.providerId, binding.version)
+            ?: return failedProvider(
+                workflow,
+                intent,
+                register,
+                invocationId(intent),
+                null,
+                "PROVIDER_NOT_FOUND: provider ${binding.providerId}@${binding.version} is not registered",
+            )
+        val descriptor = registration.descriptor
+        val invocationId = invocationId(intent)
+        val input = materialize(evaluate(binding.input, workflow, parameters, context))
+        val config = materialize(evaluate(binding.config, workflow, parameters, context))
+        validateProviderBinding(descriptor.inputSchema.validate(input), "provider input")
+        validateProviderBinding(descriptor.configurationSchema.validate(config), "provider configuration")
+
+        val invocationEvent = recordProviderEvent(
+            workflow,
+            intent,
+            invocationId,
+            null,
+            ProviderEventType.INVOCATION,
+            causationId = intent.id.value,
+            register = register,
+        )
+
+        val implementation = registration.implementation
+            ?: return failedProvider(
+                workflow,
+                intent,
+                register,
+                invocationId,
+                null,
+                "PROVIDER_UNAVAILABLE: provider ${binding.providerId}@${binding.version} has no in-process implementation",
+                invocationEvent.eventId,
+            )
+        val attemptId = AttemptId("attempt-${nextId()}")
+        val attemptEvent = recordProviderEvent(
+            workflow,
+            intent,
+            invocationId,
+            attemptId,
+            ProviderEventType.ATTEMPT_STARTED,
+            causationId = invocationEvent.eventId,
+            register = register,
+        )
+        val request = ProviderInvocationRequest(
+            providerId = binding.providerId,
+            providerVersion = binding.version,
+            invocationId = invocationId,
+            attemptId = attemptId,
+            input = input,
+            config = config,
+            idempotencyKey = invocationId.value,
+        )
+        val messages = try {
+            implementation.invoke(request)
+        } catch (failure: Throwable) {
+            val diagnostic = safeProviderThrowable("PROVIDER_EXCEPTION", failure)
+            recordProviderEvent(
+                workflow,
+                intent,
+                invocationId,
+                attemptId,
+                ProviderEventType.FAILED,
+                causationId = attemptEvent.eventId,
+                register = register,
+                diagnostic = diagnostic,
+            )
+            return ProviderExecutionResult(ProviderActivationStatus.COMPLETED, invocationId, attemptId, diagnostic)
+        }
+
+        val seenEmissionIds = mutableSetOf<EmissionId>()
+        var terminal: ProviderEventType? = null
+        var terminalFailure: String? = null
+        try {
+            for (message in messages) {
+                if (terminal != null) {
+                    return protocolFailure(
+                        workflow,
+                        intent,
+                        register,
+                        invocationId,
+                        attemptId,
+                        attemptEvent.eventId,
+                        "PROTOCOL_ORDER_VIOLATION: received ${messageName(message)} after ${terminal!!.name.lowercase()}",
+                        emission = message as? ProviderLifecycleMessage.Emission,
+                    )
+                }
+                when (message) {
+                    is ProviderLifecycleMessage.Emission -> {
+                        val received = recordProviderEvent(
+                            workflow,
+                            intent,
+                            invocationId,
+                            attemptId,
+                            ProviderEventType.EMISSION_RECEIVED,
+                            causationId = attemptEvent.eventId,
+                            register = register,
+                            emissionId = message.emissionId,
+                            value = message.value,
+                            correlationId = message.correlationId,
+                        )
+                        val validationFailure = validateEmission(
+                            descriptor,
+                            register,
+                            message,
+                            invocationId,
+                            attemptId,
+                            seenEmissionIds,
+                        )
+                        if (validationFailure != null) {
+                            return refusal(
+                                workflow,
+                                intent,
+                                register,
+                                invocationId,
+                                attemptId,
+                                received.eventId,
+                                message,
+                                validationFailure,
+                            )
+                        }
+                        seenEmissionIds += message.emissionId
+                        val targetContext = message.correlationId?.let { correlation ->
+                            if (correlation.isBlank()) {
+                                return refusal(
+                                    workflow,
+                                    intent,
+                                    register,
+                                    invocationId,
+                                    attemptId,
+                                    received.eventId,
+                                    message,
+                                    "PROTOCOL_INVALID_CORRELATION: correlation id must not be blank",
+                                )
+                            }
+                            ContextId(correlation)
+                        } ?: intent.contextId
+                        commitAssignment(
+                            workflow = workflow,
+                            intent = intent,
+                            register = register,
+                            value = message.value,
+                            invocationId = invocationId,
+                            emissionId = message.emissionId,
+                            causationId = received.eventId,
+                            contextId = targetContext,
+                        )
+                        recordProviderEvent(
+                            workflow,
+                            intent,
+                            invocationId,
+                            attemptId,
+                            ProviderEventType.EMISSION_ACCEPTED,
+                            causationId = received.eventId,
+                            register = register,
+                            emissionId = message.emissionId,
+                            value = message.value,
+                            correlationId = message.correlationId,
+                        )
+                    }
+                    ProviderLifecycleMessage.Completed -> {
+                        if (!descriptor.lifecycle.completes) {
+                            return protocolFailure(
+                                workflow,
+                                intent,
+                                register,
+                                invocationId,
+                                attemptId,
+                                attemptEvent.eventId,
+                                "PROTOCOL_UNSUPPORTED_COMPLETION: provider descriptor does not allow completion",
+                            )
+                        }
+                        terminal = ProviderEventType.COMPLETED
+                        recordProviderEvent(
+                            workflow,
+                            intent,
+                            invocationId,
+                            attemptId,
+                            ProviderEventType.COMPLETED,
+                            causationId = attemptEvent.eventId,
+                            register = register,
+                        )
+                    }
+                    ProviderLifecycleMessage.Open -> {
+                        if (!descriptor.lifecycle.supportsOpenActivation) {
+                            return protocolFailure(
+                                workflow,
+                                intent,
+                                register,
+                                invocationId,
+                                attemptId,
+                                attemptEvent.eventId,
+                                "PROTOCOL_UNSUPPORTED_OPEN: provider descriptor does not allow open activation",
+                            )
+                        }
+                        terminal = ProviderEventType.OPEN
+                        recordProviderEvent(
+                            workflow,
+                            intent,
+                            invocationId,
+                            attemptId,
+                            ProviderEventType.OPEN,
+                            causationId = attemptEvent.eventId,
+                            register = register,
+                        )
+                    }
+                    is ProviderLifecycleMessage.Failed -> {
+                        if (!descriptor.lifecycle.fails) {
+                            return protocolFailure(
+                                workflow,
+                                intent,
+                                register,
+                                invocationId,
+                                attemptId,
+                                attemptEvent.eventId,
+                                "PROTOCOL_UNSUPPORTED_FAILURE: provider descriptor does not allow failure",
+                            )
+                        }
+                        terminal = ProviderEventType.FAILED
+                        val errorValidation = descriptor.errorSchema.validate(message.error)
+                        val diagnostic = if (errorValidation.isValid) {
+                            "PROVIDER_FAILURE: ${CanonicalValueJson.encode(message.error)}"
+                        } else {
+                            "PROTOCOL_INVALID_ERROR: ${errorValidation.errors.joinToString { "${it.path}: ${it.message}" }}"
+                        }
+                        recordProviderEvent(
+                            workflow,
+                            intent,
+                            invocationId,
+                            attemptId,
+                            ProviderEventType.FAILED,
+                            causationId = attemptEvent.eventId,
+                            register = register,
+                            error = message.error,
+                            diagnostic = diagnostic,
+                        )
+                        terminalFailure = diagnostic
+                    }
+                }
+            }
+        } catch (failure: Throwable) {
+            val diagnostic = safeProviderThrowable("PROVIDER_EXCEPTION", failure)
+            recordProviderEvent(
+                workflow,
+                intent,
+                invocationId,
+                attemptId,
+                ProviderEventType.FAILED,
+                causationId = attemptEvent.eventId,
+                register = register,
+                diagnostic = diagnostic,
+            )
+            return ProviderExecutionResult(ProviderActivationStatus.COMPLETED, invocationId, attemptId, diagnostic)
+        }
+        if (terminal == null) {
+            return protocolFailure(
+                workflow,
+                intent,
+                register,
+                invocationId,
+                attemptId,
+                attemptEvent.eventId,
+                "PROTOCOL_MISSING_TERMINAL: provider stream ended without a terminal lifecycle message",
+            )
+        }
+        return ProviderExecutionResult(
+            if (terminal == ProviderEventType.OPEN) ProviderActivationStatus.OPEN else ProviderActivationStatus.COMPLETED,
+            invocationId,
+            attemptId,
+            terminalFailure,
+        )
+    }
+
+    private fun validateEmission(
+        descriptor: io.workflow.provider.ProviderDescriptor,
+        register: CompiledRegister,
+        emission: ProviderLifecycleMessage.Emission,
+        invocationId: InvocationId,
+        attemptId: AttemptId,
+        seenEmissionIds: Set<EmissionId>,
+    ): String? = when {
+        !descriptor.lifecycle.emits -> "PROTOCOL_UNSUPPORTED_EMISSION: provider descriptor does not allow emissions"
+        emission.invocationId != invocationId -> "PROTOCOL_INVALID_EMISSION: emission invocation id ${emission.invocationId.value} does not match ${invocationId.value}"
+        emission.attemptId != attemptId -> "PROTOCOL_INVALID_EMISSION: emission attempt id ${emission.attemptId.value} does not match ${attemptId.value}"
+        emission.emissionId.value.isBlank() -> "PROTOCOL_INVALID_EMISSION: emission id must not be blank"
+        emission.emissionId in seenEmissionIds -> "PROTOCOL_DUPLICATE_EMISSION: emission id ${emission.emissionId.value} was already received for this invocation"
+        !descriptor.emissionSchema.validate(emission.value).isValid -> "INVALID_OUTPUT: ${descriptor.emissionSchema.validate(emission.value).errors.joinToString { "${it.path}: ${it.message}" }}"
+        !register.schema.validate(emission.value).isValid -> "INVALID_OUTPUT: ${register.schema.validate(emission.value).errors.joinToString { "${it.path}: ${it.message}" }}"
+        else -> null
+    }
+
+    private fun failedProvider(
+        workflow: WorkflowIrDocument,
+        intent: ActivationIntent,
+        register: CompiledRegister,
+        invocationId: InvocationId,
+        attemptId: AttemptId?,
+        diagnostic: String,
+        causationId: String = intent.id.value,
+    ): ProviderExecutionResult {
+        recordProviderEvent(
+            workflow,
+            intent,
+            invocationId,
+            attemptId,
+            ProviderEventType.FAILED,
+            causationId = causationId,
+            register = register,
+            diagnostic = diagnostic,
+        )
+        return ProviderExecutionResult(
+            ProviderActivationStatus.COMPLETED,
+            invocationId,
+            attemptId,
+            diagnostic,
+        )
+    }
+
+    private fun protocolFailure(
+        workflow: WorkflowIrDocument,
+        intent: ActivationIntent,
+        register: CompiledRegister,
+        invocationId: InvocationId,
+        attemptId: AttemptId,
+        causationId: String,
+        diagnostic: String,
+        emission: ProviderLifecycleMessage.Emission? = null,
+    ): ProviderExecutionResult {
+        if (emission != null) {
+            val received = recordProviderEvent(
+                workflow,
+                intent,
+                invocationId,
+                attemptId,
+                ProviderEventType.EMISSION_RECEIVED,
+                causationId = causationId,
+                register = register,
+                emissionId = emission.emissionId,
+                value = emission.value,
+                correlationId = emission.correlationId,
+            )
+            recordProviderEvent(
+                workflow,
+                intent,
+                invocationId,
+                attemptId,
+                ProviderEventType.EMISSION_REFUSED,
+                causationId = received.eventId,
+                register = register,
+                emissionId = emission.emissionId,
+                value = emission.value,
+                diagnostic = diagnostic,
+                correlationId = emission.correlationId,
+            )
+            // The refusal itself is caused by the received message; the local
+            // variable below keeps that link for the failure record as well.
+            val refusalCausationId = received.eventId
+            recordProviderEvent(
+                workflow,
+                intent,
+                invocationId,
+                attemptId,
+                ProviderEventType.FAILED,
+                causationId = refusalCausationId,
+                register = register,
+                diagnostic = diagnostic,
+            )
+            return ProviderExecutionResult(ProviderActivationStatus.COMPLETED, invocationId, attemptId, diagnostic)
+        }
+        recordProviderEvent(
+            workflow,
+            intent,
+            invocationId,
+            attemptId,
+            ProviderEventType.FAILED,
+            causationId = causationId,
+            register = register,
+            diagnostic = diagnostic,
+        )
+        return ProviderExecutionResult(ProviderActivationStatus.COMPLETED, invocationId, attemptId, diagnostic)
+    }
+
+    private fun refusal(
+        workflow: WorkflowIrDocument,
+        intent: ActivationIntent,
+        register: CompiledRegister,
+        invocationId: InvocationId,
+        attemptId: AttemptId,
+        causationId: String,
+        emission: ProviderLifecycleMessage.Emission,
+        diagnostic: String,
+    ): ProviderExecutionResult {
+        recordProviderEvent(
+            workflow,
+            intent,
+            invocationId,
+            attemptId,
+            ProviderEventType.EMISSION_REFUSED,
+            causationId = causationId,
+            register = register,
+            emissionId = emission.emissionId,
+            value = emission.value,
+            diagnostic = diagnostic,
+            correlationId = emission.correlationId,
+        )
+        recordProviderEvent(
+            workflow,
+            intent,
+            invocationId,
+            attemptId,
+            ProviderEventType.FAILED,
+            causationId = causationId,
+            register = register,
+            emissionId = emission.emissionId,
+            diagnostic = diagnostic,
+        )
+        return ProviderExecutionResult(ProviderActivationStatus.COMPLETED, invocationId, attemptId, diagnostic)
+    }
+
+    private fun recordProviderEvent(
+        workflow: WorkflowIrDocument,
+        intent: ActivationIntent,
+        invocationId: InvocationId,
+        attemptId: AttemptId?,
+        type: ProviderEventType,
+        causationId: String?,
+        register: CompiledRegister,
+        emissionId: EmissionId? = null,
+        value: Value? = null,
+        error: Value? = null,
+        diagnostic: String? = null,
+        correlationId: String? = null,
+    ): ProviderLifecycleEvent {
+        val event = ProviderLifecycleEvent(
+            eventId = "provider-event-${nextId()}",
+            type = type,
+            workflowId = WorkflowId(workflow.workflowId),
+            workflowVersionId = workflow.workflowVersionId,
+            executionId = intent.executionId,
+            contextId = intent.contextId,
+            producerId = register.producerId,
+            activationId = intent.activationId,
+            intentId = intent.id,
+            invocationId = invocationId,
+            attemptId = attemptId,
+            emissionId = emissionId,
+            causationId = causationId,
+            value = value,
+            error = error,
+            diagnostic = diagnostic,
+            correlationId = correlationId,
+            occurredAt = clock.now(),
+            providerId = register.provider?.providerId,
+            providerVersion = register.provider?.version,
+        )
+        journal.recordProviderEvent(event)
+        return event
+    }
+
+    private fun safeProviderThrowable(prefix: String, failure: Throwable): String =
+        "$prefix: ${failure::class.simpleName ?: "ProviderError"}: ${failure.message ?: "provider invocation failed"}"
+
+    private fun messageName(message: ProviderLifecycleMessage): String = when (message) {
+        is ProviderLifecycleMessage.Emission -> "emission"
+        ProviderLifecycleMessage.Completed -> "completion"
+        ProviderLifecycleMessage.Open -> "open"
+        is ProviderLifecycleMessage.Failed -> "failure"
+    }
+
+    private fun invocationId(intent: ActivationIntent): InvocationId = InvocationId(
+        "invocation-${stableIdentity(intent.executionId, intent.contextId, intent.producerId, intent.dependencyRevisions)}",
+    )
+
+    private fun nextId(): String = synchronized(idSource) { idSource.nextId() }
+
+    private fun validateProviderBinding(result: io.workflow.core.ValidationResult, label: String) {
+        if (!result.isValid) throw BindingFailure("$label is invalid: ${result.errors.joinToString { "${it.path}: ${it.message}" }}")
+    }
+
+    private fun validateOutput(register: CompiledRegister, value: Value) {
+        val validation = register.schema.validate(value)
+        if (!validation.isValid) throw BindingFailure(validation.errors.joinToString { "${it.path}: ${it.message}" })
+    }
+
+    private fun commitAssignment(
+        workflow: WorkflowIrDocument,
+        intent: ActivationIntent,
+        register: CompiledRegister,
+        value: Value,
+        invocationId: InvocationId?,
+        emissionId: EmissionId?,
+        causationId: String,
+        contextId: ContextId,
+    ) {
+        val assignmentId = AssignmentId("assignment-${nextId()}")
+        val batchId = JournalBatchId("batch-${nextId()}")
+        val candidate = AssignmentMutation(
+            assignmentId = assignmentId,
+            workflowId = WorkflowId(workflow.workflowId),
+            workflowVersionId = workflow.workflowVersionId,
+            executionId = intent.executionId,
+            contextId = contextId,
+            registerId = register.registerId,
+            value = value,
+            producerId = register.producerId,
+            activationId = intent.activationId,
+            dependencyRevisions = intent.dependencyRevisions,
+            invocationId = invocationId,
+            emissionId = emissionId,
+            causationId = causationId,
+            occurredAt = clock.now(),
+            mutationOrdinal = 0,
+        )
+        // Journal order is serialized here so the planner sees every earlier
+        // commit and the assignment becomes visible atomically with all intents
+        // derived from that exact view. In particular, concurrent roots cannot
+        // expose the second half of a join before its runnable intent exists.
+        synchronized(assignmentCommitLock) {
+            val currentWithCandidate = journal.allCurrent() +
+                (RegisterKey(intent.executionId, contextId, register.registerId) to candidate)
+            val downstream = planner.afterAssignment(
+                workflow,
+                intent.executionId,
+                contextId,
+                candidate,
+                currentWithCandidate,
+                batchId,
+                clock.now(),
+            )
+            journal.commit(JournalBatch(batchId, listOf(candidate), clock.now()), downstream)
+        }
+    }
+
+    private fun recordActivation(
+        intent: ActivationIntent,
+        status: ActivationRecord.Status,
+        startedAt: Instant,
+        failure: String?,
+        invocationId: InvocationId?,
+        attemptId: AttemptId?,
+    ) {
+        journal.recordActivation(
+            ActivationRecord(
+                activationId = intent.activationId,
+                intentId = intent.id,
+                workflowId = intent.workflowId,
+                workflowVersionId = intent.workflowVersionId,
+                executionId = intent.executionId,
+                producerId = intent.producerId,
+                contextId = intent.contextId,
+                dependencyRevisions = intent.dependencyRevisions,
+                status = status,
+                startedAt = startedAt,
+                completedAt = if (status == ActivationRecord.Status.OPEN) null else clock.now(),
+                failure = failure,
+                invocationId = invocationId,
+                attemptId = attemptId,
+            ),
+        )
     }
 
     private fun validateParameters(workflow: WorkflowIrDocument, parameters: Map<String, Value>) {
@@ -718,10 +1463,29 @@ class InMemoryWorkflowRunner(
     companion object {
         const val ANONYMOUS_CONTEXT = "anonymous"
         const val STARTUP_BATCH = "startup"
+        const val DEFAULT_WORKER_COUNT = 4
     }
 }
 
 typealias WorkflowRunner = InMemoryWorkflowRunner
+
+private fun stableIdentity(
+    executionId: ExecutionId,
+    contextId: ContextId,
+    producerId: ProducerId,
+    vector: Map<RegisterId, AssignmentId>,
+): String {
+    val source = buildString {
+        append(executionId.value).append('|')
+        append(contextId.value).append('|').append(producerId.value)
+        vector.toSortedMap(compareBy { it.value }).forEach { (register, assignment) ->
+            append('|').append(register.value).append('=').append(assignment.value)
+        }
+    }
+    return MessageDigest.getInstance("SHA-256")
+        .digest(source.toByteArray(Charsets.UTF_8))
+        .joinToString("") { "%02x".format(it) }
+}
 
 private object WorkflowInspection {
     fun toJson(result: WorkflowRunResult): String {
@@ -733,7 +1497,11 @@ private object WorkflowInspection {
             "mutations" to JsonArray(batch.mutations.map(::assignmentJson)),
         )) }
         val intents = journal.activationIntents().filter { it.executionId == result.executionId }.map { intent ->
-            val state = if (journal.isCompleted(intent.id)) "completed" else "pending"
+            val state = when {
+                journal.isCompleted(intent.id) -> "completed"
+                journal.isOpen(intent.id) -> "open"
+                else -> "pending"
+            }
             JsonObject(linkedMapOf(
                 "id" to JsonPrimitive(intent.id.value),
                 "activationId" to JsonPrimitive(intent.activationId.value),
@@ -763,6 +1531,8 @@ private object WorkflowInspection {
             )
             activation.completedAt?.let { fields["completedAt"] = JsonPrimitive(it.toString()) }
             activation.failure?.let { fields["failure"] = JsonPrimitive(it) }
+            activation.invocationId?.let { fields["invocationId"] = JsonPrimitive(it.value) }
+            activation.attemptId?.let { fields["attemptId"] = JsonPrimitive(it.value) }
             JsonObject(fields)
         }
         val outputObject = Json.parseToJsonElement(result.outputsJson()) as JsonObject
@@ -773,6 +1543,7 @@ private object WorkflowInspection {
             "assignments" to JsonArray(journal.assignments().filter { it.executionId == result.executionId }.map(::assignmentJson)),
             "activationIntents" to JsonArray(intents),
             "activations" to JsonArray(activations),
+            "providerEvents" to JsonArray(journal.providerEvents().filter { it.executionId == result.executionId }.map(::providerEventJson)),
         )).toString()
     }
 
@@ -801,4 +1572,30 @@ private object WorkflowInspection {
 
     private fun revisionVector(vector: Map<RegisterId, AssignmentId>): JsonObject =
         JsonObject(vector.toSortedMap(compareBy { it.value }).mapKeys { it.key.value }.mapValues { JsonPrimitive(it.value.value) })
+
+    private fun providerEventJson(event: ProviderLifecycleEvent): JsonElement {
+        val fields = linkedMapOf<String, JsonElement>(
+            "eventId" to JsonPrimitive(event.eventId),
+            "type" to JsonPrimitive(event.type.name.lowercase()),
+            "workflowId" to JsonPrimitive(event.workflowId.value),
+            "workflowVersionId" to JsonPrimitive(event.workflowVersionId.value),
+            "executionId" to JsonPrimitive(event.executionId.value),
+            "contextId" to JsonPrimitive(event.contextId.value),
+            "producerId" to JsonPrimitive(event.producerId.value),
+            "activationId" to JsonPrimitive(event.activationId.value),
+            "intentId" to JsonPrimitive(event.intentId.value),
+            "invocationId" to JsonPrimitive(event.invocationId.value),
+            "occurredAt" to JsonPrimitive(event.occurredAt.toString()),
+        )
+        event.providerId?.let { fields["providerId"] = JsonPrimitive(it) }
+        event.providerVersion?.let { fields["providerVersion"] = JsonPrimitive(it) }
+        event.attemptId?.let { fields["attemptId"] = JsonPrimitive(it.value) }
+        event.emissionId?.let { fields["emissionId"] = JsonPrimitive(it.value) }
+        event.causationId?.let { fields["causationId"] = JsonPrimitive(it) }
+        event.value?.let { fields["value"] = Json.parseToJsonElement(CanonicalValueJson.encode(it)) }
+        event.error?.let { fields["error"] = Json.parseToJsonElement(CanonicalValueJson.encode(it)) }
+        event.diagnostic?.let { fields["diagnostic"] = JsonPrimitive(it) }
+        event.correlationId?.let { fields["correlationId"] = JsonPrimitive(it) }
+        return JsonObject(fields)
+    }
 }
