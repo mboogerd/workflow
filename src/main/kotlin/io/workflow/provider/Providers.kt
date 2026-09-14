@@ -32,6 +32,40 @@ data class IdempotencyContract(
     val key: String = "logical-invocation-id",
 )
 
+/** Portable reconciliation protocol for an effect whose reply was lost. */
+data class ReconciliationRequest(
+    val formatVersion: Int = 1,
+    val providerId: String,
+    val providerVersion: Int,
+    val invocationId: InvocationId,
+    val idempotencyKey: String = invocationId.value,
+    val attemptId: AttemptId? = null,
+) {
+    init { require(formatVersion == 1) { "unsupported reconciliation protocol format $formatVersion" } }
+}
+
+enum class ReconciliationDisposition {
+    DEFINITELY_NOT_APPLIED,
+    DEFINITELY_APPLIED,
+    STILL_UNKNOWN,
+    PROTOCOL_FAILURE,
+}
+
+data class ReconciliationResult(
+    val formatVersion: Int = 1,
+    val disposition: ReconciliationDisposition,
+    /** The provider's recorded output when the effect definitely occurred. */
+    val recordedResult: Value? = null,
+    val diagnostic: String? = null,
+) {
+    init {
+        require(formatVersion == 1) { "unsupported reconciliation protocol format $formatVersion" }
+        require(disposition != ReconciliationDisposition.DEFINITELY_APPLIED || recordedResult != null) {
+            "a definitely-applied reconciliation result must include the recorded provider result"
+        }
+    }
+}
+
 /** Versions of portable artifacts with which this descriptor is compatible. */
 data class ProviderCompatibility(
     val irFormatVersions: Set<Int> = setOf(1),
@@ -54,7 +88,11 @@ data class ProviderDescriptor(
     val capabilities: Set<String> = emptySet(),
     val secrets: Set<String> = emptySet(),
     val lifecycle: ProviderLifecycle = ProviderLifecycle(),
-    val idempotency: IdempotencyContract = IdempotencyContract(),
+    /**
+     * Required for effectful/agentic providers.  It remains nullable solely so
+     * the compiler can give a source-location diagnostic for legacy descriptors.
+     */
+    val idempotency: IdempotencyContract? = IdempotencyContract(ReconciliationMode.HUMAN_INTERVENTION),
     val implementationBinding: String = "in-process",
     val protocolFormatVersion: Int = 1,
     val compatibility: ProviderCompatibility = ProviderCompatibility(),
@@ -121,6 +159,11 @@ fun interface ProviderImplementation {
 interface CancellableProviderImplementation : ProviderImplementation {
     /** Returns false when the implementation observed but could not honour cancellation. */
     fun cancel(request: ProviderInvocationRequest): Boolean
+}
+
+/** Implemented only by providers declaring QUERY_BY_INVOCATION support. */
+interface ReconciliationProviderImplementation : ProviderImplementation {
+    fun reconcile(request: ReconciliationRequest): ReconciliationResult
 }
 
 data class RegisteredProvider(
