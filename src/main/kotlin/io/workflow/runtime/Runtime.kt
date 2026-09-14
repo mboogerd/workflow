@@ -230,13 +230,80 @@ interface ActivationClaimer {
 }
 
 /**
+ * The complete journal boundary used by the runtime.  Keeping the runner
+ * dependent on this interface (rather than the in-memory implementation)
+ * makes persistence a backend choice while preserving the existing fast test
+ * store.
+ */
+interface WorkflowJournalStore : JournalBatchCommitter, CurrentViewProjection, ActivationClaimer {
+    fun commit(proposal: JournalBatchProposal, activationIntents: Collection<ActivationIntent> = emptyList()): JournalBatch {
+        require(proposal.mutations.size == 1) { "v1 journal batch must contain exactly one assignment mutation" }
+        require(proposal.mutations.single().mutationOrdinal == 0) { "the only v1 mutation must have ordinal zero" }
+        return commit(
+            JournalBatch(proposal.journalBatchId, proposal.mutations, proposal.committedAt, proposal.formatVersion),
+            activationIntents,
+        )
+    }
+
+    fun bindExecution(
+        executionId: ExecutionId,
+        workflowVersionId: WorkflowVersionId,
+        contentHash: String,
+        parameters: Map<String, Value>,
+    ): Map<String, Value>
+
+    fun persistActivationIntents(intents: Collection<ActivationIntent>)
+    fun wakeDeferredActivations(executionId: ExecutionId)
+    fun batches(): List<JournalBatch>
+    fun assignments(): List<AssignmentMutation>
+    fun activationIntents(): List<ActivationIntent>
+    fun activations(): List<ActivationRecord>
+    fun providerEvents(): List<ProviderLifecycleEvent>
+    fun providerInvocations(): List<ProviderLifecycleEvent> = providerEvents().filter { it.type == ProviderEventType.INVOCATION }
+    fun providerAttempts(): List<ProviderLifecycleEvent> = providerEvents().filter { it.type == ProviderEventType.ATTEMPT_STARTED }
+    fun providerEmissions(): List<ProviderLifecycleEvent> = providerEvents().filter {
+        it.type == ProviderEventType.EMISSION_RECEIVED ||
+            it.type == ProviderEventType.EMISSION_ACCEPTED ||
+            it.type == ProviderEventType.EMISSION_REFUSED
+    }
+    fun providerFailures(): List<ProviderLifecycleEvent> = providerEvents().filter { it.type == ProviderEventType.FAILED }
+    fun events(): List<ProviderLifecycleEvent> = providerEvents()
+    fun providerLifecycleEvents(): List<ProviderLifecycleEvent> = providerEvents()
+    fun invocationRecords(): List<ProviderLifecycleEvent> = providerInvocations()
+    fun attemptRecords(): List<ProviderLifecycleEvent> = providerAttempts()
+    fun emissionRecords(): List<ProviderLifecycleEvent> = providerEmissions()
+    fun failureRecords(): List<ProviderLifecycleEvent> = providerFailures()
+    fun assignment(id: AssignmentId): AssignmentMutation?
+    fun recordProviderEvent(event: ProviderLifecycleEvent)
+    fun releaseActivation(intentId: ActivationIntentId)
+    fun keepActivationOpen(intentId: ActivationIntentId)
+    fun stopActivation(intentId: ActivationIntentId)
+    fun stopExecution(executionId: ExecutionId)
+    fun deferActivationIfMissing(intentId: ActivationIntentId, required: Set<RegisterKey>): Boolean
+    fun hasPendingActivations(executionId: ExecutionId): Boolean
+    fun isOpen(intentId: ActivationIntentId): Boolean
+    fun isStopped(intentId: ActivationIntentId): Boolean
+    fun recordActivation(record: ActivationRecord)
+    fun isCompleted(intentId: ActivationIntentId): Boolean
+    fun rebuildCurrentView(): Map<RegisterKey, AssignmentMutation>
+
+    /** Persist a definition identity even when it has no execution yet. */
+    fun recordWorkflowDefinition(
+        workflowId: WorkflowId,
+        workflowVersionId: WorkflowVersionId,
+        contentHash: String,
+        content: String? = null,
+    ) {}
+}
+
+/**
  * An ordered in-memory journal. The lock covers batch validation, revision
  * allocation, journal append, current-view projection, and intent persistence.
  */
 class InMemoryJournalStore(
     private val clock: Clock = SystemClock,
     private val idSource: IdSource = UuidIdSource(),
-) : JournalBatchCommitter, CurrentViewProjection, ActivationClaimer {
+) : WorkflowJournalStore {
     private val lock = Any()
     private val journalBatches = mutableListOf<JournalBatch>()
     private val currentAssignments = linkedMapOf<RegisterKey, AssignmentMutation>()
@@ -252,6 +319,7 @@ class InMemoryJournalStore(
     private val providerEventIds = mutableSetOf<String>()
     private val assignmentsById = linkedMapOf<AssignmentId, AssignmentMutation>()
     private val executionBindings = linkedMapOf<ExecutionId, ExecutionBinding>()
+    private val workflowDefinitions = linkedMapOf<Pair<WorkflowId, WorkflowVersionId>, WorkflowDefinitionRecord>()
 
     private data class ExecutionBinding(
         val workflowVersionId: WorkflowVersionId,
@@ -259,7 +327,7 @@ class InMemoryJournalStore(
         val parameters: Map<String, Value>,
     )
 
-    fun bindExecution(
+    override fun bindExecution(
         executionId: ExecutionId,
         workflowVersionId: WorkflowVersionId,
         contentHash: String,
@@ -272,6 +340,21 @@ class InMemoryJournalStore(
         }
         executionBindings.putIfAbsent(executionId, proposed)
         executionBindings.getValue(executionId).parameters
+    }
+
+    override fun recordWorkflowDefinition(
+        workflowId: WorkflowId,
+        workflowVersionId: WorkflowVersionId,
+        contentHash: String,
+        content: String?,
+    ) = synchronized(lock) {
+        val key = workflowId to workflowVersionId
+        val proposed = WorkflowDefinitionRecord(workflowId, workflowVersionId, contentHash, content)
+        val existing = workflowDefinitions[key]
+        require(existing == null || existing == proposed) {
+            "workflow version is already bound to different content"
+        }
+        workflowDefinitions[key] = proposed
     }
 
     override fun commit(batch: JournalBatch, activationIntents: Collection<ActivationIntent>): JournalBatch =
@@ -335,7 +418,7 @@ class InMemoryJournalStore(
      * v1 cardinality check live at the storage boundary even for callers that
      * do not construct the guarded core JournalBatch first.
      */
-    fun commit(proposal: JournalBatchProposal, activationIntents: Collection<ActivationIntent> = emptyList()): JournalBatch {
+    override fun commit(proposal: JournalBatchProposal, activationIntents: Collection<ActivationIntent>): JournalBatch {
         require(proposal.mutations.size == 1) { "v1 journal batch must contain exactly one assignment mutation" }
         require(proposal.mutations.single().mutationOrdinal == 0) {
             "the only v1 mutation must have ordinal zero"
@@ -351,6 +434,8 @@ class InMemoryJournalStore(
         )
     }
 
+    fun commit(proposal: JournalBatchProposal): JournalBatch = commit(proposal, emptyList())
+
     /** Convenience boundary for tests that construct a mutation directly. */
     fun commit(mutation: AssignmentMutation, activationIntents: Collection<ActivationIntent> = emptyList()): JournalBatch {
         val batch = JournalBatch(
@@ -362,7 +447,7 @@ class InMemoryJournalStore(
     }
 
     /** Persist startup work, which has no assignment mutation as its cause. */
-    fun persistActivationIntents(intents: Collection<ActivationIntent>) = synchronized(lock) {
+    override fun persistActivationIntents(intents: Collection<ActivationIntent>) = synchronized(lock) {
         intents.forEach { intent ->
             val duplicate = activationIntents[intent.id]
             require(duplicate == null || duplicate.sameIdentityAndProvenance(intent)) {
@@ -382,28 +467,28 @@ class InMemoryJournalStore(
 
     override fun allCurrent(): Map<RegisterKey, AssignmentMutation> = synchronized(lock) { currentAssignments.toMap() }
 
-    fun batches(): List<JournalBatch> = synchronized(lock) { journalBatches.toList() }
-    fun assignments(): List<AssignmentMutation> = synchronized(lock) { journalBatches.map { it.assignment } }
-    fun activationIntents(): List<ActivationIntent> = synchronized(lock) { activationIntents.values.toList() }
-    fun activations(): List<ActivationRecord> = synchronized(lock) { activationRecords.toList() }
-    fun providerEvents(): List<ProviderLifecycleEvent> = synchronized(lock) { providerEvents.toList() }
-    fun events(): List<ProviderLifecycleEvent> = providerEvents()
-    fun providerLifecycleEvents(): List<ProviderLifecycleEvent> = providerEvents()
-    fun providerInvocations(): List<ProviderLifecycleEvent> = providerEvents().filter { it.type == ProviderEventType.INVOCATION }
-    fun providerAttempts(): List<ProviderLifecycleEvent> = providerEvents().filter { it.type == ProviderEventType.ATTEMPT_STARTED }
-    fun providerEmissions(): List<ProviderLifecycleEvent> = providerEvents().filter {
+    override fun batches(): List<JournalBatch> = synchronized(lock) { journalBatches.toList() }
+    override fun assignments(): List<AssignmentMutation> = synchronized(lock) { journalBatches.map { it.assignment } }
+    override fun activationIntents(): List<ActivationIntent> = synchronized(lock) { activationIntents.values.toList() }
+    override fun activations(): List<ActivationRecord> = synchronized(lock) { activationRecords.toList() }
+    override fun providerEvents(): List<ProviderLifecycleEvent> = synchronized(lock) { providerEvents.toList() }
+    override fun events(): List<ProviderLifecycleEvent> = providerEvents()
+    override fun providerLifecycleEvents(): List<ProviderLifecycleEvent> = providerEvents()
+    override fun providerInvocations(): List<ProviderLifecycleEvent> = providerEvents().filter { it.type == ProviderEventType.INVOCATION }
+    override fun providerAttempts(): List<ProviderLifecycleEvent> = providerEvents().filter { it.type == ProviderEventType.ATTEMPT_STARTED }
+    override fun providerEmissions(): List<ProviderLifecycleEvent> = providerEvents().filter {
         it.type == ProviderEventType.EMISSION_RECEIVED ||
             it.type == ProviderEventType.EMISSION_ACCEPTED ||
             it.type == ProviderEventType.EMISSION_REFUSED
     }
-    fun providerFailures(): List<ProviderLifecycleEvent> = providerEvents().filter { it.type == ProviderEventType.FAILED }
-    fun invocationRecords(): List<ProviderLifecycleEvent> = providerInvocations()
-    fun attemptRecords(): List<ProviderLifecycleEvent> = providerAttempts()
-    fun emissionRecords(): List<ProviderLifecycleEvent> = providerEmissions()
-    fun failureRecords(): List<ProviderLifecycleEvent> = providerFailures()
-    fun assignment(id: AssignmentId): AssignmentMutation? = synchronized(lock) { assignmentsById[id] }
+    override fun providerFailures(): List<ProviderLifecycleEvent> = providerEvents().filter { it.type == ProviderEventType.FAILED }
+    override fun invocationRecords(): List<ProviderLifecycleEvent> = providerInvocations()
+    override fun attemptRecords(): List<ProviderLifecycleEvent> = providerAttempts()
+    override fun emissionRecords(): List<ProviderLifecycleEvent> = providerEmissions()
+    override fun failureRecords(): List<ProviderLifecycleEvent> = providerFailures()
+    override fun assignment(id: AssignmentId): AssignmentMutation? = synchronized(lock) { assignmentsById[id] }
 
-    fun recordProviderEvent(event: ProviderLifecycleEvent) = synchronized(lock) {
+    override fun recordProviderEvent(event: ProviderLifecycleEvent) = synchronized(lock) {
         require(providerEventIds.add(event.eventId)) { "provider event id is already committed" }
         providerEvents += event
     }
@@ -434,7 +519,7 @@ class InMemoryJournalStore(
      * Administratively stop one activation. Stopping is an operational fact;
      * it does not append a register assignment or a provider completion event.
      */
-    fun stopActivation(intentId: ActivationIntentId) = synchronized(lock) {
+    override fun stopActivation(intentId: ActivationIntentId) = synchronized(lock) {
         require(intentId in activationIntents) { "cannot stop an unknown activation intent" }
         require(intentId !in completedIntentIds) { "cannot stop a completed activation intent" }
         claimedIntentIds -= intentId
@@ -445,7 +530,7 @@ class InMemoryJournalStore(
     }
 
     /** Stop every unfinished activation belonging to one hosted execution. */
-    fun stopExecution(executionId: ExecutionId) = synchronized(lock) {
+    override fun stopExecution(executionId: ExecutionId) = synchronized(lock) {
         val unfinished = activationIntents.values.filter {
             it.executionId == executionId && it.id !in completedIntentIds
         }
@@ -459,13 +544,13 @@ class InMemoryJournalStore(
     }
 
     /** Return an in-flight claim to the durable queue after an unhandled worker error. */
-    fun releaseActivation(intentId: ActivationIntentId) = synchronized(lock) {
+    override fun releaseActivation(intentId: ActivationIntentId) = synchronized(lock) {
         require(intentId in activationIntents) { "cannot release an unknown activation intent" }
         claimedIntentIds -= intentId
     }
 
     /** Park an open activation until a future stream-driving API resumes it. */
-    fun keepActivationOpen(intentId: ActivationIntentId) = synchronized(lock) {
+    override fun keepActivationOpen(intentId: ActivationIntentId) = synchronized(lock) {
         require(intentId in activationIntents) { "cannot keep an unknown activation intent open" }
         require(intentId !in completedIntentIds) { "cannot reopen a completed activation intent" }
         claimedIntentIds -= intentId
@@ -476,7 +561,7 @@ class InMemoryJournalStore(
      * Park work only while a required register is still absent. Readiness and
      * the claim transition share the journal lock to prevent a lost wake-up.
      */
-    fun deferActivationIfMissing(intentId: ActivationIntentId, required: Set<RegisterKey>): Boolean = synchronized(lock) {
+    override fun deferActivationIfMissing(intentId: ActivationIntentId, required: Set<RegisterKey>): Boolean = synchronized(lock) {
         require(intentId in activationIntents) { "cannot defer an unknown activation intent" }
         require(intentId !in completedIntentIds) { "cannot defer a completed activation intent" }
         val missing = required.filterTo(linkedSetOf()) { it !in currentAssignments }
@@ -488,13 +573,13 @@ class InMemoryJournalStore(
     }
 
     /** Reconsider durable deferred work when an execution resumes. */
-    fun wakeDeferredActivations(executionId: ExecutionId) = synchronized(lock) {
+    override fun wakeDeferredActivations(executionId: ExecutionId) = synchronized(lock) {
         val awakened = deferredIntentIds.filter { deferredId -> activationIntents[deferredId]?.executionId == executionId }
         deferredIntentIds.removeAll(awakened.toSet())
         awakened.forEach(deferredRequirements::remove)
     }
 
-    fun hasPendingActivations(executionId: ExecutionId): Boolean = synchronized(lock) {
+    override fun hasPendingActivations(executionId: ExecutionId): Boolean = synchronized(lock) {
         activationIntents.values.any {
             it.executionId == executionId &&
                 it.id !in completedIntentIds &&
@@ -504,11 +589,11 @@ class InMemoryJournalStore(
         }
     }
 
-    fun isOpen(intentId: ActivationIntentId): Boolean = synchronized(lock) { intentId in openIntentIds }
+    override fun isOpen(intentId: ActivationIntentId): Boolean = synchronized(lock) { intentId in openIntentIds }
 
-    fun isStopped(intentId: ActivationIntentId): Boolean = synchronized(lock) { intentId in stoppedIntentIds }
+    override fun isStopped(intentId: ActivationIntentId): Boolean = synchronized(lock) { intentId in stoppedIntentIds }
 
-    fun recordActivation(record: ActivationRecord) = synchronized(lock) {
+    override fun recordActivation(record: ActivationRecord) = synchronized(lock) {
         val intent = activationIntents[record.intentId]
             ?: error("cannot record activation for an unknown intent")
         require(record.activationId == intent.activationId)
@@ -525,10 +610,10 @@ class InMemoryJournalStore(
         if (existing >= 0) activationRecords[existing] = record else activationRecords += record
     }
 
-    fun isCompleted(intentId: ActivationIntentId): Boolean = synchronized(lock) { intentId in completedIntentIds }
+    override fun isCompleted(intentId: ActivationIntentId): Boolean = synchronized(lock) { intentId in completedIntentIds }
 
     /** Rebuild the projection from authoritative ordered assignment records. */
-    fun rebuildCurrentView(): Map<RegisterKey, AssignmentMutation> =
+    override fun rebuildCurrentView(): Map<RegisterKey, AssignmentMutation> =
         CurrentViews.rebuild(batches()).also { rebuilt -> synchronized(lock) {
             currentAssignments.clear()
             currentAssignments.putAll(rebuilt)
@@ -715,7 +800,7 @@ class ExpressionActivationPlanner : ActivationPlanner {
 data class WorkflowRunResult(
     val executionId: ExecutionId,
     val outputs: Map<String, PublishedOutput>,
-    val journal: InMemoryJournalStore,
+    val journal: WorkflowJournalStore,
     val failures: List<String> = emptyList(),
     /** State observed when this result snapshot was produced. */
     val executionState: WorkflowExecutionState = WorkflowExecutionState.QUIESCENT,
@@ -745,6 +830,14 @@ data class WorkflowRunResult(
 }
 
 class WorkflowExecutionException(message: String) : IllegalArgumentException(message)
+
+/** Stable identity and optional source payload for one persisted workflow version. */
+data class WorkflowDefinitionRecord(
+    val workflowId: WorkflowId,
+    val workflowVersionId: WorkflowVersionId,
+    val contentHash: String,
+    val content: String? = null,
+)
 
 private class BindingFailure(message: String) : IllegalArgumentException(message)
 
@@ -806,7 +899,7 @@ class InMemoryWorkflowRunner(
     private val compiler: WorkflowCompiler = WorkflowCompiler(),
     private val clock: Clock = SystemClock,
     private val idSource: IdSource = UuidIdSource(),
-    val journal: InMemoryJournalStore = InMemoryJournalStore(clock, idSource),
+    val journal: WorkflowJournalStore = InMemoryJournalStore(clock, idSource),
     private val planner: ActivationPlanner = ExpressionActivationPlanner(),
     private val providerRegistry: ProviderRegistry = compiler.providerRegistry,
     private val workerCount: Int = DEFAULT_WORKER_COUNT,
@@ -903,6 +996,11 @@ class InMemoryWorkflowRunner(
         beforeActivation: (ActivationIntent) -> Unit = {},
     ): HostedWorkflowExecution {
         validateParameters(workflow, parameters)
+        journal.recordWorkflowDefinition(
+            WorkflowId(workflow.workflowId),
+            workflow.workflowVersionId,
+            workflow.contentHash,
+        )
         val boundParameters = journal.bindExecution(
             executionId,
             workflow.workflowVersionId,
