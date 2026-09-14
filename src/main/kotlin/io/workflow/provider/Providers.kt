@@ -87,6 +87,9 @@ data class ProviderInvocationRequest(
     val input: Value,
     val config: Value,
     val idempotencyKey: String = invocationId.value,
+    /** Runtime provenance for providers activated inside a reactive match. */
+    val parentActivationId: io.workflow.core.ActivationId? = null,
+    val discriminatorRevision: io.workflow.core.AssignmentId? = null,
 ) {
     val key: ProviderKey get() = ProviderKey(providerId, providerVersion)
     val version: Int get() = providerVersion

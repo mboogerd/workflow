@@ -32,6 +32,9 @@ data class AssignmentMutation(
     val occurredAt: Instant,
     val formatVersion: Int = 1,
     val mutationOrdinal: Int = 0,
+    /** Provenance for a producer nested below a reactive match. */
+    val parentActivationId: ActivationId? = null,
+    val discriminatorRevision: AssignmentId? = null,
 )
 data class JournalBatch(
     val journalBatchId: JournalBatchId,
@@ -53,6 +56,13 @@ data class ActivationIntent(
     val journalBatchId: JournalBatchId, val createdAt: Instant,
     /** The immutable register-revision snapshot captured by this activation. */
     val dependencyRevisions: Map<RegisterId, AssignmentId> = emptyMap(),
+    /** Non-null for a producer activated as one selected match branch. */
+    val parentActivationId: ActivationId? = null,
+    val targetRegisterId: RegisterId? = null,
+    val discriminatorRevision: AssignmentId? = null,
+    val branchTag: String? = null,
+    /** Lexical values captured by an enclosing match activation. */
+    val lexicalBindings: Map<String, Value> = emptyMap(),
 ) {
     val intentId: ActivationIntentId get() = id
 }
