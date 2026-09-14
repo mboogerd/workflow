@@ -11,7 +11,7 @@ import java.nio.file.Path
 
 fun main(args: Array<String>) {
     if (args.isEmpty() || args.first() == "--help") {
-        println("No command was given. Use validate, compile, run, or inspect.")
+        println("No command was given. Use validate, compile, run, inspect, or stop. Add --stop to administratively stop a hosted run.")
         return
     }
     when (args.first()) {
@@ -37,9 +37,13 @@ fun main(args: Array<String>) {
             Files.writeString(Path.of(args[outputIndex + 1]), result.ir!!.canonicalJson() + "\n")
             println(args[outputIndex + 1])
         }
-        "run", "inspect" -> runFile(args, inspectionOnly = args.first() == "inspect")
+        "run", "inspect", "stop" -> runFile(
+            args,
+            inspectionOnly = args.first() == "inspect" || args.first() == "stop",
+            administrativeStop = args.first() == "stop",
+        )
         else -> {
-            System.err.println("unknown command '${args.first()}'; use validate, compile, run, or inspect")
+            System.err.println("unknown command '${args.first()}'; use validate, compile, run, inspect, or stop")
             kotlin.system.exitProcess(2)
         }
     }
@@ -70,7 +74,7 @@ private fun providerRegistry(args: Array<String>): io.workflow.provider.Provider
     }
 }
 
-private fun runFile(args: Array<String>, inspectionOnly: Boolean) {
+private fun runFile(args: Array<String>, inspectionOnly: Boolean, administrativeStop: Boolean = false) {
     if (args.size < 2) {
         System.err.println("${args.first()} requires a YAML path")
         kotlin.system.exitProcess(2)
@@ -105,7 +109,9 @@ private fun runFile(args: Array<String>, inspectionOnly: Boolean) {
         kotlin.system.exitProcess(1)
     }
     val result = try {
-        InMemoryWorkflowRunner(compiler = compiler, providerRegistry = providers).execute(compilation.ir!!, parameters)
+        val host = InMemoryWorkflowRunner(compiler = compiler, providerRegistry = providers)
+            .start(compilation.ir!!, parameters)
+        if (administrativeStop || args.contains("--stop")) host.stop() else host.result()
     } catch (failure: Exception) {
         System.err.println("workflow execution failed: ${failure.message ?: "execution error"}")
         kotlin.system.exitProcess(1)
