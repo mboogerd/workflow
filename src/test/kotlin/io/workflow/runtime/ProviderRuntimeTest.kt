@@ -47,6 +47,46 @@ class ProviderRuntimeTest {
     ) = ProviderRegistry().also { it.register(descriptor(id), implementation) }
 
     @Test
+    fun `pure provider retries with one logical invocation and durable backoff decision`() {
+        val calls = AtomicInteger()
+        val registry = ProviderRegistry().also { providers ->
+            providers.register(descriptor(), ProviderImplementation { request ->
+                if (calls.incrementAndGet() == 1) listOf(ProviderLifecycleMessage.Failed(Value.ObjectValue(mapOf("class" to Value.StringValue("transient")))))
+                else listOf(
+                    ProviderLifecycleMessage.Emission(Value.StringValue("ok"), EmissionId("ok"), request.invocationId, request.attemptId),
+                    ProviderLifecycleMessage.Completed,
+                )
+            })
+        }
+        val policyYaml = """
+            workflow:
+              id: provider-retry
+              version: 1
+              context:
+                value:
+                  provider: test-provider
+                  version: 1
+                  policy: {maximum-attempts: 2, retryable-error-classes: [transient], backoff-schedule-millis: [25]}
+              outputs: [value]
+        """.trimIndent()
+        val compiled = WorkflowCompiler(registry).compile(policyYaml)
+        assertTrue(compiled.isValid, compiled.diagnostics.joinToString())
+        assertEquals("2", ((compiled.ir!!.registers.first { it.provider != null }.provider!!.policy as Value.ObjectValue).fields["maximum-attempts"] as Value.IntegerValue).value.toString())
+        val result = InMemoryWorkflowRunner(
+            compiler = WorkflowCompiler(registry),
+            idSource = io.workflow.core.DeterministicIdSource("retry-"),
+            clock = FixedClock(Instant.EPOCH), workerCount = 1,
+        ).run(policyYaml, executionId = ExecutionId("retry-execution"))
+
+        assertTrue(result.isSuccessful, result.failures.joinToString())
+        assertEquals(Value.StringValue("ok"), result.outputs.getValue("value").value)
+        assertEquals(1, result.journal.providerInvocations().size)
+        assertEquals(2, result.journal.providerAttempts().size)
+        assertEquals(1, result.journal.providerEvents().count { it.type == ProviderEventType.RETRY_SCHEDULED })
+        assertEquals(2, result.journal.providerAttempts().map { it.attemptId }.distinct().size)
+    }
+
+    @Test
     fun `provider emissions commit independently and activate downstream work`() {
         val registry = registry { request ->
             listOf(
