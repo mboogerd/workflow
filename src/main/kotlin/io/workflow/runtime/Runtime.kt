@@ -1,8 +1,8 @@
 package io.workflow.runtime
 
 import io.workflow.compiler.CompiledRegister
-import io.workflow.compiler.CompiledProducer
 import io.workflow.compiler.CompiledMatch
+import io.workflow.compiler.CompiledProducer
 import io.workflow.compiler.Expression
 import io.workflow.compiler.PathStep
 import io.workflow.compiler.Requirement
@@ -152,6 +152,8 @@ data class ProviderInvocation(
     val invocationId: InvocationId,
     val attemptId: AttemptId,
     val input: Value,
+    val parentActivationId: ActivationId? = null,
+    val discriminatorRevision: AssignmentId? = null,
 )
 
 data class ProviderEmission(
@@ -277,8 +279,6 @@ class InMemoryJournalStore(
             assignmentsById[committedMutation.assignmentId] = committedMutation
             currentAssignments[key] = committedMutation
             activationIntents.forEach { intent -> this.activationIntents.putIfAbsent(intent.id, intent) }
-            // A match whose selected branch was waiting for a required binding
-            // gets another chance whenever the captured context advances.
             deferredIntentIds.removeIf { deferredId ->
                 this.activationIntents[deferredId]?.let { deferred ->
                     deferred.executionId == mutation.executionId && deferred.contextId == mutation.contextId
@@ -368,7 +368,7 @@ class InMemoryJournalStore(
     /** Claiming reserves an intent; completion acknowledges it durably. */
     override fun claimNextActivation(executionId: ExecutionId): ActivationIntent? = synchronized(lock) {
         activationIntents.values.firstOrNull {
-                it.executionId == executionId &&
+            it.executionId == executionId &&
                 it.id !in completedIntentIds &&
                 it.id !in claimedIntentIds &&
                 it.id !in openIntentIds &&
@@ -398,9 +398,8 @@ class InMemoryJournalStore(
     }
 
     /**
-     * Park work only if its required registers are still absent. The readiness
-     * check and claim transition share the journal lock so an assignment cannot
-     * be committed in the gap and leave the intent asleep indefinitely.
+     * Park work only while a required register is still absent. Readiness and
+     * the claim transition share the journal lock to prevent a lost wake-up.
      */
     fun deferActivationIfMissing(intentId: ActivationIntentId, required: Set<RegisterKey>): Boolean = synchronized(lock) {
         require(intentId in activationIntents) { "cannot defer an unknown activation intent" }
@@ -411,7 +410,7 @@ class InMemoryJournalStore(
         true
     }
 
-    /** Reconsider durable deferred work when an execution is resumed. */
+    /** Reconsider durable deferred work when an execution resumes. */
     fun wakeDeferredActivations(executionId: ExecutionId) = synchronized(lock) {
         deferredIntentIds.removeIf { deferredId -> activationIntents[deferredId]?.executionId == executionId }
     }
@@ -437,6 +436,9 @@ class InMemoryJournalStore(
         require(record.contextId == intent.contextId)
         require(record.producerId == intent.producerId)
         require(record.dependencyRevisions == intent.dependencyRevisions)
+        require(record.parentActivationId == intent.parentActivationId)
+        require(record.discriminatorRevision == intent.discriminatorRevision)
+        require(record.branchTag == intent.branchTag)
         activationRecords += record
     }
 
@@ -557,9 +559,9 @@ class ExpressionActivationPlanner : ActivationPlanner {
         )
     }
 
+    /** A match reacts to its discriminator, not to dependencies of unselected cases. */
     private fun activationDependencies(register: CompiledRegister): List<String> =
-        if (register.match != null) expressionDependencies(register.match.discriminator)
-        else register.dependencies
+        register.match?.let { expressionDependencies(it.discriminator) } ?: register.dependencies
 
     private fun expressionDependencies(expression: Expression): List<String> = when (expression) {
         is Expression.Ref -> if (expression.root !in LEXICAL_ROOTS) listOf(expression.root) else emptyList()
@@ -799,16 +801,13 @@ class InMemoryWorkflowRunner(
         parameters: Map<String, Value>,
         intent: ActivationIntent,
     ): String? {
-        val resolved = resolveProducer(workflow, intent.producerId)
+        val register = resolveProducer(workflow, intent.producerId)
             ?: throw WorkflowExecutionException("activation refers to unknown producer ${intent.producerId.value}")
-        val register = resolved.register
         val started = clock.now()
         return try {
             val context = capturedContext(intent)
             if (register.match != null) {
-                if (!activateMatch(workflow, parameters, intent, register, context)) {
-                    return null
-                }
+                if (!activateMatch(workflow, parameters, intent, register, context)) return null
                 recordActivation(intent, ActivationRecord.Status.COMPLETED, started, null, null, null)
                 journal.completeActivation(intent.id)
                 null
@@ -850,12 +849,10 @@ class InMemoryWorkflowRunner(
         }
     }
 
-    private data class ResolvedProducer(val register: CompiledRegister, val producer: CompiledProducer)
-
-    private fun resolveProducer(workflow: WorkflowIrDocument, producerId: ProducerId): ResolvedProducer? {
-        fun visit(register: CompiledRegister): ResolvedProducer? {
+    private fun resolveProducer(workflow: WorkflowIrDocument, producerId: ProducerId): CompiledRegister? {
+        fun visit(register: CompiledRegister): CompiledRegister? {
             val producer = register.compiledProducer ?: return null
-            if (producer.producerId == producerId) return ResolvedProducer(register, producer)
+            if (producer.producerId == producerId) return register
             return when (producer) {
                 is CompiledProducer.Match -> producer.value.cases.values.firstNotNullOfOrNull { nested ->
                     visit(nested.asRegister(register))
@@ -869,23 +866,48 @@ class InMemoryWorkflowRunner(
 
     private fun CompiledProducer.asRegister(target: CompiledRegister): CompiledRegister = when (this) {
         is CompiledProducer.Expression -> target.copy(
-            producerId = producerId, producer = value, schema = schema, dependencies = dependencies,
-            provider = null, compiledProducer = this, match = null, map = null,
+            producerId = producerId,
+            producer = value,
+            dependencies = dependencies,
+            schema = schema,
+            provider = null,
+            compiledProducer = this,
+            match = null,
+            map = null,
         )
         is CompiledProducer.Provider -> target.copy(
-            producerId = producerId, producer = value.input, schema = schema, dependencies = dependencies,
-            provider = value, compiledProducer = this, match = null, map = null,
+            producerId = producerId,
+            producer = value.input,
+            dependencies = dependencies,
+            schema = schema,
+            provider = value,
+            compiledProducer = this,
+            match = null,
+            map = null,
         )
         is CompiledProducer.Match -> target.copy(
-            producerId = producerId, producer = value.discriminator, schema = schema, dependencies = dependencies,
-            provider = null, compiledProducer = this, match = value, map = null,
+            producerId = producerId,
+            producer = value.discriminator,
+            dependencies = dependencies,
+            schema = schema,
+            provider = null,
+            compiledProducer = this,
+            match = value,
+            map = null,
         )
         is CompiledProducer.Map -> target.copy(
-            producerId = producerId, producer = value.input, schema = schema, dependencies = dependencies,
-            provider = null, compiledProducer = this, match = null, map = value,
+            producerId = producerId,
+            producer = value.input,
+            dependencies = dependencies,
+            schema = schema,
+            provider = null,
+            compiledProducer = this,
+            match = null,
+            map = value,
         )
     }
 
+    /** Select and durably enqueue one case producer for this captured revision. */
     private fun activateMatch(
         workflow: WorkflowIrDocument,
         parameters: Map<String, Value>,
@@ -894,13 +916,18 @@ class InMemoryWorkflowRunner(
         context: Map<RegisterId, AssignmentMutation>,
     ): Boolean {
         val match = register.match ?: error("match binding is missing")
-        val discriminator = materialize(evaluate(match.discriminator, workflow, parameters, context, intent.lexicalBindings))
+        val discriminator = materialize(
+            evaluate(match.discriminator, workflow, parameters, context, intent.lexicalBindings),
+        )
         val objectValue = discriminator as? Value.ObjectValue
             ?: throw BindingFailure("MATCH_INVALID_RUNTIME_TAG: discriminator must be a tagged object")
         val tag = objectValue.fields[match.discriminatorSchema.discriminator] as? Value.StringValue
-            ?: throw BindingFailure("MATCH_INVALID_RUNTIME_TAG: discriminator field '${match.discriminatorSchema.discriminator}' must be a string")
+            ?: throw BindingFailure(
+                "MATCH_INVALID_RUNTIME_TAG: discriminator field '${match.discriminatorSchema.discriminator}' must be a string",
+            )
         val branch = match.cases[tag.value]
             ?: throw BindingFailure("MATCH_UNKNOWN_TAG: '${tag.value}' is not a declared match case")
+
         var current: Map<RegisterId, AssignmentMutation>
         while (true) {
             current = journal.currentFor(intent.executionId, intent.contextId)
@@ -911,21 +938,22 @@ class InMemoryWorkflowRunner(
             val keys = missing.mapTo(linkedSetOf()) { RegisterKey(intent.executionId, intent.contextId, it) }
             if (journal.deferActivationIfMissing(intent.id, keys)) return false
         }
+
         val branchVector = linkedMapOf<RegisterId, AssignmentId>()
-        intent.dependencyRevisions.forEach { (id, revision) -> branchVector[id] = revision }
+        branchVector.putAll(intent.dependencyRevisions)
         branch.dependencies.forEach { dependencyName ->
             val dependency = workflow.registers.firstOrNull { it.name == dependencyName } ?: return@forEach
             val assignment = context[dependency.registerId] ?: current[dependency.registerId]
-            branchVector[dependency.registerId] = assignment?.assignmentId ?: AssignmentId(ExpressionActivationPlanner.ABSENT_REVISION)
+            branchVector[dependency.registerId] =
+                assignment?.assignmentId ?: AssignmentId(ExpressionActivationPlanner.ABSENT_REVISION)
         }
         val discriminatorRevision = discriminatorRevision(match, workflow, intent)
-        val identitySource = buildString {
+        val identity = sha256(buildString {
             append(intent.activationId.value).append('|')
             append(branch.producerId.value).append('|')
-            append(discriminatorRevision?.value ?: "literal")
-        }
-        val identity = sha256(identitySource)
-        val nested = ActivationIntent(
+            append(discriminatorRevision?.value ?: "lexical")
+        })
+        journal.persistActivationIntents(listOf(ActivationIntent(
             id = ActivationIntentId("intent-match-$identity"),
             activationId = ActivationId("activation-match-$identity"),
             producerId = branch.producerId,
@@ -938,11 +966,10 @@ class InMemoryWorkflowRunner(
             dependencyRevisions = branchVector.toSortedMap(compareBy { it.value }),
             parentActivationId = intent.activationId,
             targetRegisterId = register.registerId,
+            lexicalBindings = intent.lexicalBindings + ("match" to discriminator),
             discriminatorRevision = discriminatorRevision,
             branchTag = tag.value,
-            lexicalBindings = intent.lexicalBindings + ("match" to discriminator),
-        )
-        journal.persistActivationIntents(listOf(nested))
+        )))
         return true
     }
 
@@ -961,8 +988,9 @@ class InMemoryWorkflowRunner(
         intent: ActivationIntent,
     ): AssignmentId? {
         val root = (match.discriminator as? Expression.Ref)?.root ?: return intent.discriminatorRevision
-        val register = workflow.registers.firstOrNull { it.name == root } ?: return intent.discriminatorRevision
-        return intent.dependencyRevisions[register.registerId]?.takeUnless {
+        val discriminatorRegister = workflow.registers.firstOrNull { it.name == root }
+            ?: return intent.discriminatorRevision
+        return intent.dependencyRevisions[discriminatorRegister.registerId]?.takeUnless {
             it.value == ExpressionActivationPlanner.ABSENT_REVISION
         } ?: intent.discriminatorRevision
     }
@@ -1520,9 +1548,8 @@ class InMemoryWorkflowRunner(
         // derived from that exact view. In particular, concurrent roots cannot
         // expose the second half of a join before its runnable intent exists.
         synchronized(assignmentCommitLock) {
-            val effectiveRegisterId = targetRegisterId ?: register.registerId
             val currentWithCandidate = journal.allCurrent() +
-                (RegisterKey(intent.executionId, contextId, effectiveRegisterId) to candidate.copy(registerId = effectiveRegisterId))
+                (RegisterKey(intent.executionId, contextId, candidate.registerId) to candidate)
             val downstream = planner.afterAssignment(
                 workflow,
                 intent.executionId,
@@ -1602,7 +1629,8 @@ class InMemoryWorkflowRunner(
         is Expression.Ref -> {
             val root = when {
                 expression.root == "parameters" -> Value.ObjectValue(parameters)
-                expression.root in setOf("item", "key", "match") -> lexicalBindings[expression.root] ?: Value.Null
+                expression.root == "item" || expression.root == "key" || expression.root == "match" ->
+                    lexicalBindings[expression.root] ?: Value.Null
                 else -> {
                     val register = workflow.registers.firstOrNull { it.name == expression.root }
                         ?: throw BindingFailure("unknown reference root '${expression.root}'")
@@ -1615,22 +1643,35 @@ class InMemoryWorkflowRunner(
             if (expression.requirement == Requirement.OPTIONAL) Evaluated.OptionalResult(selected != null, selected)
             else Evaluated.ValueResult(selected ?: throw BindingFailure("required reference path is missing"))
         }
-        is Expression.ObjectValue -> Evaluated.ValueResult(Value.ObjectValue(expression.fields.mapValues { materialize(evaluate(it.value, workflow, parameters, context, lexicalBindings)) }))
-        is Expression.ArrayValue -> Evaluated.ValueResult(Value.ArrayValue(expression.items.map { materialize(evaluate(it, workflow, parameters, context, lexicalBindings)) }))
+        is Expression.ObjectValue -> Evaluated.ValueResult(Value.ObjectValue(expression.fields.mapValues {
+            materialize(evaluate(it.value, workflow, parameters, context, lexicalBindings))
+        }))
+        is Expression.ArrayValue -> Evaluated.ValueResult(Value.ArrayValue(expression.items.map {
+            materialize(evaluate(it, workflow, parameters, context, lexicalBindings))
+        }))
         is Expression.Concat -> Evaluated.ValueResult(Value.StringValue(expression.parts.joinToString("") {
             (materialize(evaluate(it, workflow, parameters, context, lexicalBindings)) as? Value.StringValue)?.value
                 ?: throw BindingFailure("concat operand is not a string")
         }))
         is Expression.Equals -> Evaluated.ValueResult(
-            Value.BooleanValue(equivalent(evaluate(expression.left, workflow, parameters, context, lexicalBindings), evaluate(expression.right, workflow, parameters, context, lexicalBindings))),
+            Value.BooleanValue(equivalent(
+                evaluate(expression.left, workflow, parameters, context, lexicalBindings),
+                evaluate(expression.right, workflow, parameters, context, lexicalBindings),
+            )),
         )
         is Expression.Present -> {
             val value = evaluate(expression.value, workflow, parameters, context, lexicalBindings)
             Evaluated.ValueResult(Value.BooleanValue(value is Evaluated.OptionalResult && value.present))
         }
-        is Expression.And -> Evaluated.ValueResult(Value.BooleanValue(expression.predicates.all { boolValue(evaluate(it, workflow, parameters, context, lexicalBindings)) }))
-        is Expression.Or -> Evaluated.ValueResult(Value.BooleanValue(expression.predicates.any { boolValue(evaluate(it, workflow, parameters, context, lexicalBindings)) }))
-        is Expression.Not -> Evaluated.ValueResult(Value.BooleanValue(!boolValue(evaluate(expression.predicate, workflow, parameters, context, lexicalBindings))))
+        is Expression.And -> Evaluated.ValueResult(Value.BooleanValue(expression.predicates.all {
+            boolValue(evaluate(it, workflow, parameters, context, lexicalBindings))
+        }))
+        is Expression.Or -> Evaluated.ValueResult(Value.BooleanValue(expression.predicates.any {
+            boolValue(evaluate(it, workflow, parameters, context, lexicalBindings))
+        }))
+        is Expression.Not -> Evaluated.ValueResult(Value.BooleanValue(
+            !boolValue(evaluate(expression.predicate, workflow, parameters, context, lexicalBindings)),
+        ))
     }
 
     private fun selectPath(value: Value, path: List<PathStep>): Value? {

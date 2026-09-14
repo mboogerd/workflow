@@ -1,10 +1,12 @@
 package io.workflow.provider
 
-import io.workflow.core.Value
-import io.workflow.core.ValueSchema
-import io.workflow.core.InvocationId
+import io.workflow.core.ActivationId
+import io.workflow.core.AssignmentId
 import io.workflow.core.AttemptId
 import io.workflow.core.EmissionId
+import io.workflow.core.InvocationId
+import io.workflow.core.Value
+import io.workflow.core.ValueSchema
 
 /** The effect classification used by a provider descriptor. */
 enum class EffectClass { PURE, READ, EFFECT, AGENTIC }
@@ -87,9 +89,9 @@ data class ProviderInvocationRequest(
     val input: Value,
     val config: Value,
     val idempotencyKey: String = invocationId.value,
-    /** Runtime provenance for providers activated inside a reactive match. */
-    val parentActivationId: io.workflow.core.ActivationId? = null,
-    val discriminatorRevision: io.workflow.core.AssignmentId? = null,
+    /** Present when this provider is the selected producer of a match. */
+    val parentActivationId: ActivationId? = null,
+    val discriminatorRevision: AssignmentId? = null,
 ) {
     val key: ProviderKey get() = ProviderKey(providerId, providerVersion)
     val version: Int get() = providerVersion
