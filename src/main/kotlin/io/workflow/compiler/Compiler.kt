@@ -112,7 +112,7 @@ class WorkflowCompiler(
     private val maxDocumentCodePoints: Int = 1_000_000,
     private val maxNesting: Int = 64,
     private val maxAliases: Int = 32,
-    private val providerRegistry: ProviderRegistry = ProviderRegistry(),
+    val providerRegistry: ProviderRegistry = ProviderRegistry(),
 ) {
     constructor(providerRegistry: ProviderRegistry) : this(1_000_000, 64, 32, providerRegistry)
 

@@ -153,6 +153,9 @@ class ProviderRegistry(
     @Synchronized
     fun descriptors(): List<ProviderDescriptor> = registrations.values.map { it.descriptor }
 
+    @Synchronized
+    fun isEmpty(): Boolean = registrations.isEmpty()
+
     companion object {
         fun empty(): ProviderRegistry = ProviderRegistry()
     }

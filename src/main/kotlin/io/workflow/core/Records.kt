@@ -9,6 +9,7 @@ class FixedClock(private val instant: Instant) : Clock { override fun now() = in
 interface IdSource { fun nextId(): String }
 class DeterministicIdSource(private val prefix: String = "id-") : IdSource {
     private var n = 0L
+    @Synchronized
     override fun nextId() = "$prefix${++n}"
 }
 class UuidIdSource : IdSource { override fun nextId(): String = UUID.randomUUID().toString() }
