@@ -997,6 +997,7 @@ class InMemoryWorkflowRunner(
     private val providerRegistry: ProviderRegistry = compiler.providerRegistry,
     private val workerCount: Int = DEFAULT_WORKER_COUNT,
     private val retryScheduler: RetryScheduler = RetryScheduler.SYSTEM,
+    private val beforeReconciliationDecision: (io.workflow.provider.ReconciliationResult) -> Unit = {},
 ) {
     private val assignmentCommitLock = Any()
     private val mapActivations = ConcurrentHashMap<ActivationId, MapActivationState>()
@@ -1184,7 +1185,8 @@ class InMemoryWorkflowRunner(
         intents.forEach { intent ->
             if (journal.isCompleted(intent.id) || journal.isStopped(intent.id)) return@forEach
             val lifecycle = events.filter { it.intentId == intent.id }
-            if (journal.isAmbiguous(intent.id)) {
+            val reconciliationStarted = lifecycle.any { it.type == ProviderEventType.RECONCILIATION_REQUESTED }
+            if (journal.isAmbiguous(intent.id) || reconciliationStarted) {
                 val attempt = lifecycle.lastOrNull { it.type == ProviderEventType.ATTEMPT_STARTED } ?: return@forEach
                 val register = resolveProducer(workflow, intent.producerId) ?: return@forEach
                 val binding = register.provider ?: return@forEach
@@ -1196,9 +1198,11 @@ class InMemoryWorkflowRunner(
                     "AMBIGUOUS_ATTEMPT: resuming durable intervention state",
                     providerRegistry.resolve(binding.providerId, binding.version)?.descriptor?.idempotency,
                 )
-                val status = if (outcome.status == ProviderActivationStatus.COMPLETED && outcome.failure == null) ActivationRecord.Status.COMPLETED else ActivationRecord.Status.AMBIGUOUS
+                val status = if (outcome.status == ProviderActivationStatus.COMPLETED) {
+                    if (outcome.failure == null) ActivationRecord.Status.COMPLETED else ActivationRecord.Status.FAILED
+                } else ActivationRecord.Status.AMBIGUOUS
                 recordActivation(intent, status, attempt.occurredAt, outcome.failure, attempt.invocationId, attempt.attemptId)
-                if (status == ActivationRecord.Status.COMPLETED) journal.completeActivation(intent.id) else journal.holdAmbiguousActivation(intent.id)
+                if (status == ActivationRecord.Status.AMBIGUOUS) journal.holdAmbiguousActivation(intent.id) else journal.completeActivation(intent.id)
                 return@forEach
             }
             val latestAttemptIndex = lifecycle.indexOfLast { it.type == ProviderEventType.ATTEMPT_STARTED }
@@ -1246,11 +1250,11 @@ class InMemoryWorkflowRunner(
                             diagnostic = "AMBIGUOUS_ATTEMPT: provider attempt has no terminal lifecycle record",
                             contract = providerRegistry.resolve(binding.providerId, binding.version)?.descriptor?.idempotency,
                         )
-                        val status = if (outcome.status == ProviderActivationStatus.COMPLETED && outcome.failure == null) {
-                            ActivationRecord.Status.COMPLETED
+                        val status = if (outcome.status == ProviderActivationStatus.COMPLETED) {
+                            if (outcome.failure == null) ActivationRecord.Status.COMPLETED else ActivationRecord.Status.FAILED
                         } else ActivationRecord.Status.AMBIGUOUS
                         recordActivation(intent, status, attempt.occurredAt, outcome.failure, attempt.invocationId, attempt.attemptId)
-                        if (status == ActivationRecord.Status.COMPLETED) journal.completeActivation(intent.id) else journal.holdAmbiguousActivation(intent.id)
+                        if (status == ActivationRecord.Status.AMBIGUOUS) journal.holdAmbiguousActivation(intent.id) else journal.completeActivation(intent.id)
                     }
                 }
                 else -> Unit
@@ -2779,28 +2783,45 @@ class InMemoryWorkflowRunner(
     ): ProviderExecutionResult {
         val binding = register.provider ?: return ProviderExecutionResult(ProviderActivationStatus.AMBIGUOUS, invocationId, attemptId, diagnostic)
         val registration = providerRegistry.resolve(binding.providerId, binding.version)
-        val request = ReconciliationRequest(
-            providerId = binding.providerId,
-            providerVersion = binding.version,
-            invocationId = invocationId,
-            attemptId = attemptId,
-        )
-        val requested = recordProviderEvent(
-            workflow, intent, invocationId, attemptId, ProviderEventType.RECONCILIATION_REQUESTED,
-            causationId = invocationEventId, register = register,
-            diagnostic = "RECONCILIATION_REQUEST: formatVersion=1; idempotencyKey=${request.idempotencyKey}; cause=$diagnostic",
-        )
+        val lifecycle = journal.providerEvents().filter { it.intentId == intent.id }
+        val latestAttemptIndex = lifecycle.indexOfLast { it.type == ProviderEventType.ATTEMPT_STARTED }
+        val latestDecisionIndex = lifecycle.indexOfLast { it.type == ProviderEventType.RECONCILIATION_DECISION }
+        val latestDecision = lifecycle.getOrNull(latestDecisionIndex)
+        if (latestDecision?.diagnostic?.contains("reuse-confirmed-applied-result") == true &&
+            journal.assignments().any { it.invocationId == invocationId }) {
+            return ProviderExecutionResult(ProviderActivationStatus.COMPLETED, invocationId, attemptId, null)
+        }
+        if (latestDecisionIndex > latestAttemptIndex && latestDecision?.diagnostic?.let {
+                it.contains("safe-retry=idempotent-by-key") || it.contains("confirmed-not-applied")
+            } == true) {
+            return retryAfterReconciliation(
+                workflow, parameters, context, intent, register, invocationId, latestDecision,
+                attemptNumber, activationStartedAt, policy, attemptId,
+                ambiguousWhenExhausted = latestDecision.diagnostic!!.contains("idempotent-by-key"),
+            )
+        }
         if (contract?.mode == ReconciliationMode.IDEMPOTENT_BY_INVOCATION) {
+            val requested = recordProviderEvent(
+                workflow, intent, invocationId, attemptId, ProviderEventType.RECONCILIATION_REQUESTED,
+                causationId = invocationEventId, register = register,
+                diagnostic = "RECONCILIATION_REQUEST: formatVersion=1; idempotencyKey=${invocationId.value}; cause=$diagnostic",
+            )
             val decision = recordProviderEvent(
                 workflow, intent, invocationId, attemptId, ProviderEventType.RECONCILIATION_DECISION,
                 causationId = requested.eventId, register = register,
                 diagnostic = "RECONCILIATION_DECISION: safe-retry=idempotent-by-key",
             )
-            return if (attemptNumber < policy.maximumAttempts) {
-                executeProvider(workflow, parameters, context, intent, register, invocationId, decision.eventId, attemptNumber + 1, activationStartedAt)
-            } else ProviderExecutionResult(ProviderActivationStatus.AMBIGUOUS, invocationId, attemptId, "INTERVENTION_REQUIRED: idempotent effect exhausted retry budget")
+            return retryAfterReconciliation(
+                workflow, parameters, context, intent, register, invocationId, decision,
+                attemptNumber, activationStartedAt, policy, attemptId, ambiguousWhenExhausted = true,
+            )
         }
         if (contract?.mode != ReconciliationMode.QUERY_BY_INVOCATION || registration?.implementation !is ReconciliationProviderImplementation) {
+            val requested = recordProviderEvent(
+                workflow, intent, invocationId, attemptId, ProviderEventType.RECONCILIATION_REQUESTED,
+                causationId = invocationEventId, register = register,
+                diagnostic = "RECONCILIATION_REQUEST: formatVersion=1; idempotencyKey=${invocationId.value}; cause=$diagnostic",
+            )
             recordProviderEvent(
                 workflow, intent, invocationId, attemptId, ProviderEventType.RECONCILIATION_DECISION,
                 causationId = requested.eventId, register = register,
@@ -2808,51 +2829,91 @@ class InMemoryWorkflowRunner(
             )
             return ProviderExecutionResult(ProviderActivationStatus.AMBIGUOUS, invocationId, attemptId, "INTERVENTION_REQUIRED: $diagnostic")
         }
-        val reconciliation = try {
-            recordProviderEvent(workflow, intent, invocationId, attemptId, ProviderEventType.RECONCILIATION_ATTEMPTED,
-                causationId = requested.eventId, register = register, diagnostic = "RECONCILIATION_ATTEMPT: formatVersion=1")
-            registration.implementation.reconcile(request)
-        } catch (failure: Throwable) {
-            io.workflow.provider.ReconciliationResult(
-                disposition = ReconciliationDisposition.PROTOCOL_FAILURE,
-                diagnostic = safeProviderThrowable("RECONCILIATION_EXCEPTION", failure),
-            )
+        val latestResultIndex = lifecycle.indexOfLast { it.type == ProviderEventType.RECONCILIATION_RESULT }
+        val latestResult = lifecycle.getOrNull(latestResultIndex)
+        val recorded = latestResult?.takeIf {
+            reconciliationDisposition(it) == ReconciliationDisposition.DEFINITELY_APPLIED || latestResultIndex > latestDecisionIndex
         }
-        val outcome = recordProviderEvent(
-            workflow, intent, invocationId, attemptId, ProviderEventType.RECONCILIATION_RESULT,
-            causationId = requested.eventId, register = register, value = reconciliation.recordedResult,
-            diagnostic = "RECONCILIATION_RESULT: ${reconciliation.disposition}; ${reconciliation.diagnostic.orEmpty()}",
-        )
+        val (reconciliation, outcome) = if (recorded != null) {
+            io.workflow.provider.ReconciliationResult(
+                disposition = reconciliationDisposition(recorded) ?: ReconciliationDisposition.PROTOCOL_FAILURE,
+                recordedResult = recorded.value,
+                diagnostic = recorded.diagnostic,
+            ) to recorded
+        } else {
+            val reconciliationAttemptId = AttemptId("reconciliation-${nextId()}")
+            val request = ReconciliationRequest(
+                providerId = binding.providerId,
+                providerVersion = binding.version,
+                invocationId = invocationId,
+                reconciliationAttemptId = reconciliationAttemptId,
+                attemptId = attemptId,
+            )
+            val requested = recordProviderEvent(
+                workflow, intent, invocationId, attemptId, ProviderEventType.RECONCILIATION_REQUESTED,
+                causationId = invocationEventId, register = register,
+                diagnostic = "RECONCILIATION_REQUEST: formatVersion=1; idempotencyKey=${request.idempotencyKey}; cause=$diagnostic",
+            )
+            val reconciled = try {
+                recordProviderEvent(workflow, intent, invocationId, reconciliationAttemptId, ProviderEventType.RECONCILIATION_ATTEMPTED,
+                    causationId = requested.eventId, register = register, diagnostic = "RECONCILIATION_ATTEMPT: formatVersion=1")
+                registration.implementation.reconcile(request)
+            } catch (failure: Throwable) {
+                io.workflow.provider.ReconciliationResult(
+                    disposition = ReconciliationDisposition.PROTOCOL_FAILURE,
+                    diagnostic = safeProviderThrowable("RECONCILIATION_EXCEPTION", failure),
+                )
+            }
+            val recordedOutcome = recordProviderEvent(
+                workflow, intent, invocationId, reconciliationAttemptId, ProviderEventType.RECONCILIATION_RESULT,
+                causationId = requested.eventId, register = register, value = reconciled.recordedResult,
+                diagnostic = "RECONCILIATION_RESULT: ${reconciled.disposition}; ${reconciled.diagnostic.orEmpty()}",
+            )
+            reconciled to recordedOutcome
+        }
+        val decisionAttemptId = outcome.attemptId ?: attemptId
+        beforeReconciliationDecision(reconciliation)
         return when (reconciliation.disposition) {
             ReconciliationDisposition.DEFINITELY_APPLIED -> {
                 val value = reconciliation.recordedResult!!
-                validateOutput(register, value)
-                val decision = recordProviderEvent(workflow, intent, invocationId, attemptId, ProviderEventType.RECONCILIATION_DECISION,
+                val providerValidation = registration.descriptor.emissionSchema.validate(value)
+                val registerValidation = register.schema.validate(value)
+                if (!providerValidation.isValid || !registerValidation.isValid) {
+                    recordProviderEvent(
+                        workflow, intent, invocationId, decisionAttemptId, ProviderEventType.RECONCILIATION_DECISION,
+                        causationId = outcome.eventId, register = register,
+                        diagnostic = "INTERVENTION_REQUIRED: reconciliation returned an invalid recorded result",
+                    )
+                    return ProviderExecutionResult(
+                        ProviderActivationStatus.AMBIGUOUS, invocationId, attemptId,
+                        "INTERVENTION_REQUIRED: reconciliation returned an invalid recorded result",
+                    )
+                }
+                val decision = recordProviderEvent(workflow, intent, invocationId, decisionAttemptId, ProviderEventType.RECONCILIATION_DECISION,
                     causationId = outcome.eventId, register = register,
                     diagnostic = "RECONCILIATION_DECISION: reuse-confirmed-applied-result")
-                if (journal.assignments().none { it.invocationId == invocationId }) {
-                    val emissionId = EmissionId("reconciled-${invocationId.value}")
-                    val received = recordProviderEvent(workflow, intent, invocationId, attemptId, ProviderEventType.EMISSION_RECEIVED,
-                        causationId = decision.eventId, register = register, emissionId = emissionId, value = value,
-                        diagnostic = "RECONCILED_EFFECT_RESULT")
-                    commitAssignment(workflow, intent, register, value, invocationId, emissionId, received.eventId,
-                        intent.contextId, intent.targetRegisterId, intent.parentActivationId, intent.discriminatorRevision)
-                    recordProviderEvent(workflow, intent, invocationId, attemptId, ProviderEventType.EMISSION_ACCEPTED,
-                        causationId = received.eventId, register = register, emissionId = emissionId, value = value,
-                        diagnostic = "RECONCILIATION_PROVENANCE: decision=${decision.eventId}")
-                }
+                val emissionId = EmissionId("reconciled-${invocationId.value}")
+                val received = recordProviderEvent(workflow, intent, invocationId, decisionAttemptId, ProviderEventType.EMISSION_RECEIVED,
+                    causationId = decision.eventId, register = register, emissionId = emissionId, value = value,
+                    diagnostic = "RECONCILED_EFFECT_RESULT")
+                commitAssignment(workflow, intent, register, value, invocationId, emissionId, received.eventId,
+                    intent.contextId, intent.targetRegisterId, intent.parentActivationId, intent.discriminatorRevision)
+                recordProviderEvent(workflow, intent, invocationId, decisionAttemptId, ProviderEventType.EMISSION_ACCEPTED,
+                    causationId = received.eventId, register = register, emissionId = emissionId, value = value,
+                    diagnostic = "RECONCILIATION_PROVENANCE: decision=${decision.eventId}")
                 ProviderExecutionResult(ProviderActivationStatus.COMPLETED, invocationId, attemptId, null)
             }
             ReconciliationDisposition.DEFINITELY_NOT_APPLIED -> {
-                val decision = recordProviderEvent(workflow, intent, invocationId, attemptId, ProviderEventType.RECONCILIATION_DECISION,
+                val decision = recordProviderEvent(workflow, intent, invocationId, decisionAttemptId, ProviderEventType.RECONCILIATION_DECISION,
                     causationId = outcome.eventId, register = register, diagnostic = "RECONCILIATION_DECISION: confirmed-not-applied")
-                if (attemptNumber < policy.maximumAttempts) {
-                    executeProvider(workflow, parameters, context, intent, register, invocationId, decision.eventId, attemptNumber + 1, activationStartedAt)
-                } else ProviderExecutionResult(ProviderActivationStatus.AMBIGUOUS, invocationId, attemptId, "INTERVENTION_REQUIRED: confirmed not applied but retry budget exhausted")
+                retryAfterReconciliation(
+                    workflow, parameters, context, intent, register, invocationId, decision,
+                    attemptNumber, activationStartedAt, policy, attemptId, ambiguousWhenExhausted = false,
+                )
             }
             ReconciliationDisposition.STILL_UNKNOWN,
             ReconciliationDisposition.PROTOCOL_FAILURE -> {
-                recordProviderEvent(workflow, intent, invocationId, attemptId, ProviderEventType.RECONCILIATION_DECISION,
+                recordProviderEvent(workflow, intent, invocationId, decisionAttemptId, ProviderEventType.RECONCILIATION_DECISION,
                     causationId = outcome.eventId, register = register,
                     diagnostic = "INTERVENTION_REQUIRED: reconciliation ${reconciliation.disposition}")
                 ProviderExecutionResult(ProviderActivationStatus.AMBIGUOUS, invocationId, attemptId,
@@ -2860,6 +2921,47 @@ class InMemoryWorkflowRunner(
             }
         }
     }
+
+    private fun retryAfterReconciliation(
+        workflow: WorkflowIrDocument,
+        parameters: Map<String, Value>,
+        context: Map<RegisterId, AssignmentMutation>,
+        intent: ActivationIntent,
+        register: CompiledRegister,
+        invocationId: InvocationId,
+        decision: ProviderLifecycleEvent,
+        attemptNumber: Int,
+        activationStartedAt: Instant,
+        policy: ProviderExecutionPolicy,
+        attemptId: AttemptId,
+        ambiguousWhenExhausted: Boolean,
+    ): ProviderExecutionResult {
+        if (attemptNumber >= policy.maximumAttempts) {
+            return ProviderExecutionResult(
+                if (ambiguousWhenExhausted) ProviderActivationStatus.AMBIGUOUS else ProviderActivationStatus.COMPLETED,
+                invocationId,
+                attemptId,
+                if (ambiguousWhenExhausted) "INTERVENTION_REQUIRED: idempotent effect exhausted retry budget"
+                else "RETRY_EXHAUSTED: confirmed effect was not applied",
+            )
+        }
+        val delay = policy.backoffForRetry(attemptNumber)
+        val due = clock.now().plus(delay)
+        recordProviderEvent(
+            workflow, intent, invocationId, attemptId, ProviderEventType.RETRY_SCHEDULED,
+            causationId = decision.eventId, register = register,
+            diagnostic = "RETRY_SCHEDULED: attempt=${attemptNumber + 1}; dueAt=$due; delayMillis=${delay.toMillis()}; reconciliationDecision=${decision.eventId}",
+        )
+        return executeProvider(
+            workflow, parameters, context, intent, register,
+            invocationOverride = invocationId, invocationCausation = decision.eventId,
+            attemptNumber = attemptNumber + 1, activationStartedAt = activationStartedAt,
+        )
+    }
+
+    private fun reconciliationDisposition(event: ProviderLifecycleEvent): ReconciliationDisposition? =
+        event.diagnostic?.substringAfter("RECONCILIATION_RESULT: ", "")?.substringBefore(';')
+            ?.takeIf(String::isNotBlank)?.let { runCatching { ReconciliationDisposition.valueOf(it) }.getOrNull() }
 
     private fun retryDueAt(event: ProviderLifecycleEvent): Instant? =
         event.diagnostic?.substringAfter("dueAt=", "")?.substringBefore(';')
