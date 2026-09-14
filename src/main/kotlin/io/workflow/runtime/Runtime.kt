@@ -280,7 +280,7 @@ interface ActivationClaimer {
  * makes persistence a backend choice while preserving the existing fast test
  * store.
  */
-interface WorkflowJournalStore : JournalBatchCommitter, CurrentViewProjection, ActivationClaimer {
+interface WorkflowJournalStore : JournalBatchCommitter, CurrentViewProjection, ActivationClaimer, RecoveryLedger {
     fun commit(proposal: JournalBatchProposal, activationIntents: Collection<ActivationIntent> = emptyList()): JournalBatch {
         require(proposal.mutations.size == 1) { "v1 journal batch must contain exactly one assignment mutation" }
         require(proposal.mutations.single().mutationOrdinal == 0) { "the only v1 mutation must have ordinal zero" }
@@ -382,6 +382,7 @@ class InMemoryJournalStore(
     private val assignmentsById = linkedMapOf<AssignmentId, AssignmentMutation>()
     private val executionBindings = linkedMapOf<ExecutionId, ExecutionBinding>()
     private val workflowDefinitions = linkedMapOf<Pair<WorkflowId, WorkflowVersionId>, WorkflowDefinitionRecord>()
+    private val recoveryLedger = InMemoryRecoveryLedger()
 
     private data class ExecutionBinding(
         val workflowVersionId: WorkflowVersionId,
@@ -569,6 +570,34 @@ class InMemoryJournalStore(
     override fun emissionRecords(): List<ProviderLifecycleEvent> = providerEmissions()
     override fun failureRecords(): List<ProviderLifecycleEvent> = providerFailures()
     override fun assignment(id: AssignmentId): AssignmentMutation? = synchronized(lock) { assignmentsById[id] }
+
+    override fun recordProposal(request: RecoveryRequest, proposal: RecoveryProposal) = synchronized(lock) {
+        recoveryLedger.recordProposal(request, proposal)
+    }
+
+    override fun recordDecision(request: RecoveryRequest, proposal: RecoveryProposal, validation: RecoveryValidation) = synchronized(lock) {
+        recoveryLedger.recordDecision(request, proposal, validation)
+    }
+
+    override fun pause(intervention: HumanIntervention) = synchronized(lock) { recoveryLedger.pause(intervention) }
+
+    override fun submitAnswer(id: String, answer: Value): HumanIntervention = synchronized(lock) {
+        recoveryLedger.submitAnswer(id, answer)
+    }
+
+    override fun intervention(id: String): HumanIntervention? = synchronized(lock) { recoveryLedger.intervention(id) }
+
+    override fun interventionHistory(id: String): List<HumanIntervention> = synchronized(lock) {
+        recoveryLedger.interventionHistory(id)
+    }
+
+    override fun recordedProposal(invocationId: InvocationId): RecoveryProposalRecord? = synchronized(lock) {
+        recoveryLedger.recordedProposal(invocationId)
+    }
+
+    override fun recordedDecision(invocationId: InvocationId): RecoveryDecisionRecord? = synchronized(lock) {
+        recoveryLedger.recordedDecision(invocationId)
+    }
 
     override fun recordProviderEvent(event: ProviderLifecycleEvent) = synchronized(lock) {
         require(providerEventIds.add(event.eventId)) { "provider event id is already committed" }
@@ -2440,7 +2469,7 @@ class InMemoryWorkflowRunner(
             ), attemptStartedAt)
             recordProviderEvent(
                 workflow, intent, invocationId, attemptId, ProviderEventType.AGENTIC_METADATA_RESOLVED,
-                causationId = attemptEvent.eventId, register = register, diagnostic = metadata.safeSummary(),
+                causationId = attemptEvent.eventId, register = register, diagnostic = metadata.safeSummary(descriptor.secrets),
             )
             AgenticInvocationEnvironment(
                 descriptor.agentic!!, metadata,

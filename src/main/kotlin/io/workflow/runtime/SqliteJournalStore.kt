@@ -496,6 +496,49 @@ class SqliteJournalStore @JvmOverloads constructor(
                 )
                 """.trimIndent(),
             )
+            statement.executeUpdate(
+                """
+                CREATE TABLE IF NOT EXISTS agent_recovery_proposals(
+                    invocation_id TEXT PRIMARY KEY,
+                    execution_id TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    proposal_json TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL
+                )
+                """.trimIndent(),
+            )
+            statement.executeUpdate(
+                """
+                CREATE TABLE IF NOT EXISTS agent_recovery_decisions(
+                    invocation_id TEXT PRIMARY KEY REFERENCES agent_recovery_proposals(invocation_id),
+                    request_json TEXT NOT NULL,
+                    proposal_json TEXT NOT NULL,
+                    accepted INTEGER NOT NULL,
+                    reason TEXT,
+                    occurred_at TEXT NOT NULL
+                )
+                """.trimIndent(),
+            )
+            statement.executeUpdate(
+                """
+                CREATE TABLE IF NOT EXISTS human_interventions(
+                    id TEXT PRIMARY KEY,
+                    payload_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """.trimIndent(),
+            )
+            statement.executeUpdate(
+                """
+                CREATE TABLE IF NOT EXISTS human_intervention_events(
+                    id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    occurred_at TEXT NOT NULL,
+                    PRIMARY KEY(id, sequence)
+                )
+                """.trimIndent(),
+            )
             statement.executeUpdate("CREATE INDEX IF NOT EXISTS idx_assignments_order ON assignments(journal_position)")
             statement.executeUpdate("CREATE INDEX IF NOT EXISTS idx_intents_ready ON activation_intents(execution_id, state, created_at)")
             statement.executeUpdate("CREATE INDEX IF NOT EXISTS idx_events_execution ON provider_events(execution_id, occurred_at)")
@@ -819,6 +862,111 @@ class SqliteJournalStore @JvmOverloads constructor(
         connection.prepareStatement("SELECT $ASSIGNMENT_COLUMNS FROM assignments WHERE assignment_id = ?").use { statement ->
             statement.setString(1, id.value)
             statement.executeQuery().use { result -> if (result.next()) readAssignment(result) else null }
+        }
+    }
+
+    override fun recordProposal(request: RecoveryRequest, proposal: RecoveryProposal): Unit = write { connection ->
+        val requestJson = encodeRecoveryRequest(request)
+        val proposalJson = encodeRecoveryProposal(proposal)
+        val existing = connection.prepareStatement(
+            "SELECT request_json, proposal_json FROM agent_recovery_proposals WHERE invocation_id = ?",
+        ).use { statement ->
+            statement.setString(1, request.invocationId.value)
+            statement.executeQuery().use { result -> if (result.next()) result.getString(1) to result.getString(2) else null }
+        }
+        if (existing != null) {
+            require(existing == (requestJson to proposalJson)) { "recovery invocation already has a different proposal" }
+        } else connection.prepareStatement(
+            "INSERT INTO agent_recovery_proposals(invocation_id, execution_id, request_json, proposal_json, occurred_at) VALUES (?, ?, ?, ?, ?)",
+        ).use { statement ->
+            statement.setString(1, request.invocationId.value); statement.setString(2, request.executionId.value)
+            statement.setString(3, requestJson); statement.setString(4, proposalJson); statement.setString(5, clock.now().toString())
+            statement.executeUpdate()
+        }
+        Unit
+    }
+
+    override fun recordDecision(request: RecoveryRequest, proposal: RecoveryProposal, validation: RecoveryValidation): Unit = write { connection ->
+        val requestJson = encodeRecoveryRequest(request)
+        val proposalJson = encodeRecoveryProposal(proposal)
+        val existing = connection.prepareStatement(
+            "SELECT request_json, proposal_json, accepted, reason FROM agent_recovery_decisions WHERE invocation_id = ?",
+        ).use { statement ->
+            statement.setString(1, request.invocationId.value)
+            statement.executeQuery().use { result -> if (result.next()) listOf(result.getString(1), result.getString(2), result.getInt(3).toString(), result.getString(4)) else null }
+        }
+        val proposed = listOf(requestJson, proposalJson, (if (validation.accepted) 1 else 0).toString(), validation.reason)
+        if (existing != null) {
+            require(existing == proposed) { "recovery invocation already has a different decision" }
+        } else connection.prepareStatement(
+            "INSERT INTO agent_recovery_decisions(invocation_id, request_json, proposal_json, accepted, reason, occurred_at) VALUES (?, ?, ?, ?, ?, ?)",
+        ).use { statement ->
+            statement.setString(1, request.invocationId.value); statement.setString(2, requestJson); statement.setString(3, proposalJson)
+            statement.setInt(4, if (validation.accepted) 1 else 0); statement.setNullableString(5, validation.reason); statement.setString(6, clock.now().toString())
+            statement.executeUpdate()
+        }
+        Unit
+    }
+
+    override fun pause(intervention: HumanIntervention): Unit = write { connection ->
+        require(intervention.state == HumanInterventionState.PAUSED) { "new intervention must be paused" }
+        val encoded = encodeHumanIntervention(intervention)
+        val existing = connection.prepareStatement("SELECT payload_json FROM human_interventions WHERE id = ?").use { statement ->
+            statement.setString(1, intervention.id); statement.executeQuery().use { result -> if (result.next()) result.getString(1) else null }
+        }
+        if (existing != null) require(existing == encoded) { "intervention id already exists with different contents" }
+        else connection.prepareStatement("INSERT INTO human_interventions(id, payload_json, updated_at) VALUES (?, ?, ?)").use { statement ->
+            statement.setString(1, intervention.id); statement.setString(2, encoded); statement.setString(3, clock.now().toString()); statement.executeUpdate()
+        }
+        if (existing == null) appendInterventionEvent(connection, intervention)
+        Unit
+    }
+
+    override fun submitAnswer(id: String, answer: Value): HumanIntervention = write { connection ->
+        val current = connection.prepareStatement("SELECT payload_json FROM human_interventions WHERE id = ?").use { statement ->
+            statement.setString(1, id); statement.executeQuery().use { result -> if (result.next()) decodeHumanIntervention(result.getString(1)) else null }
+        } ?: error("unknown intervention '$id'")
+        val updated = current.answer(answer)
+        connection.prepareStatement("UPDATE human_interventions SET payload_json = ?, updated_at = ? WHERE id = ?").use { statement ->
+            statement.setString(1, encodeHumanIntervention(updated)); statement.setString(2, clock.now().toString()); statement.setString(3, id); statement.executeUpdate()
+        }
+        appendInterventionEvent(connection, updated)
+        updated
+    }
+
+    override fun intervention(id: String): HumanIntervention? = read { connection ->
+        connection.prepareStatement("SELECT payload_json FROM human_interventions WHERE id = ?").use { statement ->
+            statement.setString(1, id); statement.executeQuery().use { result -> if (result.next()) decodeHumanIntervention(result.getString(1)) else null }
+        }
+    }
+
+    override fun interventionHistory(id: String): List<HumanIntervention> = read { connection ->
+        connection.prepareStatement("SELECT payload_json FROM human_intervention_events WHERE id = ? ORDER BY sequence").use { statement ->
+            statement.setString(1, id)
+            statement.executeQuery().use { result -> buildList { while (result.next()) add(decodeHumanIntervention(result.getString(1))) } }
+        }
+    }
+
+    override fun recordedProposal(invocationId: InvocationId): RecoveryProposalRecord? = read { connection ->
+        connection.prepareStatement(
+            "SELECT request_json, proposal_json FROM agent_recovery_proposals WHERE invocation_id = ?",
+        ).use { statement ->
+            statement.setString(1, invocationId.value)
+            statement.executeQuery().use { result -> if (!result.next()) null else RecoveryProposalRecord(
+                decodeRecoveryRequest(result.getString(1)), decodeRecoveryProposal(result.getString(2)),
+            ) }
+        }
+    }
+
+    override fun recordedDecision(invocationId: InvocationId): RecoveryDecisionRecord? = read { connection ->
+        connection.prepareStatement(
+            "SELECT request_json, proposal_json, accepted, reason FROM agent_recovery_decisions WHERE invocation_id = ?",
+        ).use { statement ->
+            statement.setString(1, invocationId.value)
+            statement.executeQuery().use { result -> if (!result.next()) null else RecoveryDecisionRecord(
+                decodeRecoveryRequest(result.getString(1)), decodeRecoveryProposal(result.getString(2)),
+                RecoveryValidation(result.getInt(3) != 0, result.getString(4)),
+            ) }
         }
     }
 
@@ -1190,6 +1338,20 @@ class SqliteJournalStore @JvmOverloads constructor(
             "INSERT OR IGNORE INTO contexts(execution_id, context_id, parent_context_id, created_at) VALUES (?, ?, ?, ?)",
         ).use { statement ->
             statement.setString(1, executionId.value); statement.setString(2, contextId.value); statement.setNullableString(3, parent?.value); statement.setString(4, clock.now().toString()); statement.executeUpdate()
+        }
+    }
+
+    private fun appendInterventionEvent(connection: Connection, intervention: HumanIntervention) {
+        val sequence = connection.prepareStatement(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM human_intervention_events WHERE id = ?",
+        ).use { statement ->
+            statement.setString(1, intervention.id); statement.executeQuery().use { result -> result.next(); result.getInt(1) }
+        }
+        connection.prepareStatement(
+            "INSERT INTO human_intervention_events(id, sequence, payload_json, occurred_at) VALUES (?, ?, ?, ?)",
+        ).use { statement ->
+            statement.setString(1, intervention.id); statement.setInt(2, sequence)
+            statement.setString(3, encodeHumanIntervention(intervention)); statement.setString(4, clock.now().toString()); statement.executeUpdate()
         }
     }
 

@@ -78,10 +78,13 @@ data class ResolvedAgentMetadata(
 ) {
     init { require(modelId.isNotBlank()) { "resolved agent model id must not be blank" } }
 
-    fun safeSummary(): String = buildString {
+    fun safeSummary(sensitiveKeys: Set<String> = emptySet()): String = buildString {
         append("model=").append(modelId)
         settings.toSortedMap().forEach { (key, value) ->
-            if (!key.contains("secret", ignoreCase = true) && !key.contains("token", ignoreCase = true)) append("; ").append(key).append('=').append(value)
+            val normalized = key.lowercase()
+            val sensitive = sensitiveKeys.any { it.equals(key, ignoreCase = true) } ||
+                listOf("secret", "token", "password", "credential", "authorization", "api_key", "apikey").any(normalized::contains)
+            if (!sensitive) append("; ").append(key).append('=').append(value)
         }
     }
 }
@@ -102,10 +105,10 @@ class AgentBudgetMeter(private val limit: AgentBudget, private val startedAt: In
         val result = when {
             tokens < 0 || costMicros < 0 || toolCalls < 0 || iterations < 0 -> AgentOperationResult.Refused("INVALID_BUDGET_DELTA", "budget deltas must be non-negative")
             Duration.between(startedAt, now) > limit.maxDuration -> AgentOperationResult.Refused("TIME_BUDGET_EXHAUSTED", "agent time budget is exhausted")
-            this.tokens + tokens > limit.maxTokens -> AgentOperationResult.Refused("TOKEN_BUDGET_EXHAUSTED", "agent token budget is exhausted")
-            this.costMicros + costMicros > limit.maxCostMicros -> AgentOperationResult.Refused("COST_BUDGET_EXHAUSTED", "agent cost budget is exhausted")
-            this.toolCalls + toolCalls > limit.maxToolCalls -> AgentOperationResult.Refused("TOOL_CALL_BUDGET_EXHAUSTED", "agent tool-call budget is exhausted")
-            this.iterations + iterations > limit.maxIterations -> AgentOperationResult.Refused("ITERATION_BUDGET_EXHAUSTED", "agent iteration budget is exhausted")
+            tokens > limit.maxTokens - this.tokens -> AgentOperationResult.Refused("TOKEN_BUDGET_EXHAUSTED", "agent token budget is exhausted")
+            costMicros > limit.maxCostMicros - this.costMicros -> AgentOperationResult.Refused("COST_BUDGET_EXHAUSTED", "agent cost budget is exhausted")
+            toolCalls > limit.maxToolCalls - this.toolCalls -> AgentOperationResult.Refused("TOOL_CALL_BUDGET_EXHAUSTED", "agent tool-call budget is exhausted")
+            iterations > limit.maxIterations - this.iterations -> AgentOperationResult.Refused("ITERATION_BUDGET_EXHAUSTED", "agent iteration budget is exhausted")
             else -> {
                 this.tokens += tokens; this.costMicros += costMicros; this.toolCalls += toolCalls; this.iterations += iterations
                 AgentOperationResult.Accepted
