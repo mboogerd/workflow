@@ -39,6 +39,12 @@ import io.workflow.provider.ProviderExecutionPolicy
 import io.workflow.provider.EffectClass
 import io.workflow.provider.errorClass
 import io.workflow.provider.CancellableProviderImplementation
+import io.workflow.provider.AgenticProviderImplementation
+import io.workflow.provider.AgentBudgetMeter
+import io.workflow.provider.AgentCapabilityGate
+import io.workflow.provider.AgenticInvocationEnvironment
+import io.workflow.provider.ResolvedAgentMetadata
+import io.workflow.provider.AgentOperationResult
 import java.security.MessageDigest
 import java.time.Duration
 import java.time.Instant
@@ -121,6 +127,13 @@ enum class ProviderEventType {
     ATTEMPT_TIMED_OUT,
     ACTIVATION_DEADLINE_EXCEEDED,
     CANCELLATION_IGNORED,
+    AGENTIC_METADATA_RESOLVED,
+    AGENTIC_BUDGET_REFUSED,
+    AGENTIC_CAPABILITY_REFUSED,
+    RECOVERY_PROPOSED,
+    RECOVERY_DECIDED,
+    HUMAN_INTERVENTION_REQUESTED,
+    HUMAN_INTERVENTION_ANSWERED,
     FAILED;
 
     companion object {
@@ -2375,10 +2388,39 @@ class InMemoryWorkflowRunner(
             discriminatorRevision = intent.discriminatorRevision,
         )
         val attemptStartedAt = clock.now()
+        val agentEnvironment = if (descriptor.effectClass == EffectClass.AGENTIC) {
+            val metadata = if (implementation is AgenticProviderImplementation) implementation.resolveMetadata(request, attemptStartedAt)
+            else ResolvedAgentMetadata(descriptor.agentic!!.modelSelectionPolicy, mapOf(
+                "strategyVersion" to descriptor.agentic.strategyVersion,
+                "promptVersion" to descriptor.agentic.promptVersion,
+            ), attemptStartedAt)
+            recordProviderEvent(
+                workflow, intent, invocationId, attemptId, ProviderEventType.AGENTIC_METADATA_RESOLVED,
+                causationId = attemptEvent.eventId, register = register, diagnostic = metadata.safeSummary(),
+            )
+            AgenticInvocationEnvironment(
+                descriptor.agentic!!, metadata,
+                AgentBudgetMeter(descriptor.agentic.budgets, attemptStartedAt) { result ->
+                    if (result is AgentOperationResult.Refused) recordProviderEvent(
+                        workflow, intent, invocationId, attemptId, ProviderEventType.AGENTIC_BUDGET_REFUSED,
+                        causationId = attemptEvent.eventId, register = register, diagnostic = "${result.code}: ${result.message}",
+                    )
+                },
+                AgentCapabilityGate(descriptor.agentic, binding.capabilities) { result ->
+                    if (result is AgentOperationResult.Refused) recordProviderEvent(
+                        workflow, intent, invocationId, attemptId, ProviderEventType.AGENTIC_CAPABILITY_REFUSED,
+                        causationId = attemptEvent.eventId, register = register, diagnostic = "${result.code}: ${result.message}",
+                    )
+                },
+            )
+        } else null
+        fun invokeProvider(): Iterable<ProviderLifecycleMessage> =
+            if (implementation is AgenticProviderImplementation) implementation.invokeAgentic(request, requireNotNull(agentEnvironment))
+            else implementation.invoke(request)
         val invokeExecutor = policy.attemptTimeout?.let { Executors.newSingleThreadExecutor() }
         val messages = try {
-            if (invokeExecutor == null) implementation.invoke(request)
-            else invokeExecutor.submit<List<ProviderLifecycleMessage>> { implementation.invoke(request).toList() }
+            if (invokeExecutor == null) invokeProvider()
+            else invokeExecutor.submit<List<ProviderLifecycleMessage>> { invokeProvider().toList() }
                 .get(policy.attemptTimeout.toMillis(), TimeUnit.MILLISECONDS)
         } catch (_: java.util.concurrent.TimeoutException) {
             val diagnostic = "ATTEMPT_TIMEOUT: limitMillis=${policy.attemptTimeout!!.toMillis()}"
@@ -2744,6 +2786,8 @@ class InMemoryWorkflowRunner(
         emission.emissionId.value.isBlank() -> "PROTOCOL_INVALID_EMISSION: emission id must not be blank"
         emission.emissionId in seenEmissionIds -> "PROTOCOL_DUPLICATE_EMISSION: emission id ${emission.emissionId.value} was already received for this invocation"
         !descriptor.emissionSchema.validate(emission.value).isValid -> "INVALID_OUTPUT: ${descriptor.emissionSchema.validate(emission.value).errors.joinToString { "${it.path}: ${it.message}" }}"
+        descriptor.agentic?.outputAcceptance?.requireNonNull == true && emission.value == Value.Null -> "INVALID_OUTPUT: agentic output must not be null"
+        descriptor.agentic?.outputAcceptance?.schema?.validate(emission.value)?.isValid == false -> "INVALID_OUTPUT: ${descriptor.agentic.outputAcceptance.schema.validate(emission.value).errors.joinToString { "${it.path}: ${it.message}" }}"
         !register.schema.validate(emission.value).isValid -> "INVALID_OUTPUT: ${register.schema.validate(emission.value).errors.joinToString { "${it.path}: ${it.message}" }}"
         else -> null
     }
