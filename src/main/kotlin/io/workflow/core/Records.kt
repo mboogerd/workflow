@@ -28,6 +28,9 @@ data class AssignmentMutation(
     val invocationId: InvocationId? = null,
     val emissionId: EmissionId? = null,
     val causationId: String? = null,
+    /** Provenance for a producer nested below a reactive match activation. */
+    val parentActivationId: ActivationId? = null,
+    val discriminatorRevision: AssignmentId? = null,
     val revision: Long = 1,
     val occurredAt: Instant,
     /** Provenance for an assignment produced by one finite-map item. */
@@ -70,7 +73,13 @@ data class ActivationIntent(
     val mapItemKey: String? = null,
     val mapInputRevision: AssignmentId? = null,
     val parentContextId: ContextId? = null,
+    /** Generic nesting data shared with later compound producer runtimes. */
+    val parentActivationId: ActivationId? = null,
+    val targetRegisterId: RegisterId? = null,
     val lexicalBindings: Map<String, Value> = emptyMap(),
+    /** Match-specific selection provenance. */
+    val discriminatorRevision: AssignmentId? = null,
+    val branchTag: String? = null,
 ) {
     val intentId: ActivationIntentId get() = id
     val parentMapActivationId: ActivationId? get() = mapActivationId
