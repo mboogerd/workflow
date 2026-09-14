@@ -1,0 +1,1 @@
+{"id":"replay","formatVersion":1,"requirementReferences":["execution-semantics.md#replay","providers-and-effects.md#portability"],"workflow":"examples/multi-repository.yaml","parameters":{"repositories":[{"repository":"app/service","commit":"svc-001","dependencies":["lib/core"]},{"repository":"lib/core","commit":"core-001","dependencies":[]}]},"replay":true}

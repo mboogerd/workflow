@@ -23,6 +23,10 @@ workflow:
             provider: demo.repository-model
             version: 1
             with: {$ref: "$.item"}
+            policy:
+              maximum-attempts: 2
+              retryable-error-classes: [transient]
+              backoff-schedule-millis: [0]
         output: model
     topology:
       provider: demo.dependency-topology
@@ -32,4 +36,11 @@ workflow:
       provider: demo.system-model
       version: 1
       with: {$ref: "$.topology"}
-  outputs: [topology, architecture]
+    publication:
+      provider: demo.architecture-publication
+      version: 1
+      with: {$ref: "$.architecture"}
+      policy:
+        maximum-attempts: 2
+        retryable-error-classes: [transient]
+  outputs: [topology, architecture, publication]

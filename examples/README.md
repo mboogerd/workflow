@@ -67,3 +67,37 @@ latest-only scheduling, or prevent a stale completion from being committed after
 a newer activation under the v1 policy. Non-main fixtures are explicitly
 filtered by the continuous inventory provider and produce an empty global
 snapshot.
+
+## v1 operator commands
+
+The generated launcher and Gradle development command expose the same surface:
+
+- `validate <workflow.yaml> [--providers demo]` checks YAML, provider bindings,
+  schemas, policies, and canonical IR compatibility without executing it.
+- `compile <workflow.yaml> --output <ir.json> [--providers demo]` writes the
+  canonical, portable IR artifact.
+- `run <workflow.yaml> --parameters <json-or-file> [--providers demo]` starts a
+  new execution and prints exported outputs; add `--inspect` for provenance JSON.
+- `inspect` and `stop` use the same workflow/parameter arguments for an
+  in-process execution. Durable administration uses the database commands below.
+- `resume <database> [--execution <id>] [--providers demo]` resumes durable
+  runnable work and open providers; `replay <database> [--execution <id>]`
+  rebuilds outputs from records and deliberately loads no provider profile.
+- `human-answer <database> --intervention <id> --answer <json>` supplies a typed
+  answer for an authorized paused recovery request.
+
+SQLite is selected explicitly by `--database <path>` for the continuous demo.
+Provider profiles are explicit (`--providers demo`); no ambient integration or
+credential discovery occurs. Successful operator commands print JSON when they
+return execution data, making them suitable for automation.
+
+## Release demonstration
+
+The continuous demonstration has a public release-safety fixture. Emit a commit
+whose id starts with `release-fault-` (for example `release-fault-a`) to make one
+model-builder attempt fail transiently and retry with the same invocation, then
+make the fake architecture publication perform one external write and lose its
+reply. Inspection records `retry_scheduled`, `reconciliation_requested`, and
+`reconciliation_decision`; the exported `publication.externalWrites` remains
+exactly `1`. The distribution smoke test runs this command through the installed
+launcher, so this behavior is release evidence rather than only a unit fixture.

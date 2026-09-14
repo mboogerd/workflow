@@ -10,7 +10,12 @@ import io.workflow.provider.deterministicAgenticDescriptor
 import io.workflow.provider.ProviderLifecycleMessage
 import io.workflow.provider.ProviderRegistry
 import io.workflow.provider.ReconciliationMode
+import io.workflow.provider.ReconciliationDisposition
+import io.workflow.provider.ReconciliationProviderImplementation
+import io.workflow.provider.ReconciliationRequest
+import io.workflow.provider.ReconciliationResult
 import java.math.BigInteger
+import java.util.concurrent.ConcurrentHashMap
 
 /** Deterministic, offline providers used by the single-repository example. */
 object DemoProviders {
@@ -21,6 +26,7 @@ object DemoProviders {
     const val REPOSITORY_MODEL = "demo.repository-model"
     const val TOPOLOGY = "demo.dependency-topology"
     const val SYSTEM_MODEL = "demo.system-model"
+    const val ARCHITECTURE_PUBLICATION = "demo.architecture-publication"
     /** Durable, controllable providers used by the continuous repository demonstration. */
     const val COMMIT_EVENTS = "demo.commit-events"
     const val CONTINUOUS_INVENTORY = "demo.continuous-repository-inventory"
@@ -121,8 +127,14 @@ object DemoProviders {
         "gatheredModelRevisions" to ValueSchema.Object.Field(ValueSchema.Array(string)),
         "summary" to ValueSchema.Object.Field(string),
     ))
+    val publicationSchema = ValueSchema.Object(mapOf(
+        "architecture" to ValueSchema.Object.Field(systemArchitectureSchema),
+        "externalWrites" to ValueSchema.Object.Field(ValueSchema.Integer),
+    ))
 
     fun registry(): ProviderRegistry = ProviderRegistry().also { registry ->
+        val modelAttempts = ConcurrentHashMap<String, Int>()
+        val publication = FakeArchitecturePublication()
         registry.register(
             ProviderDescriptor(COMMIT_EVENTS, 1, ValueSchema.Any, commitEventSchema, effectClass = EffectClass.READ),
         ) {
@@ -174,12 +186,16 @@ object DemoProviders {
         }
         registry.register(
             ProviderDescriptor(REPOSITORY_MODEL, 1, repositoryInputSchema, repositoryModelSchema, effectClass = EffectClass.AGENTIC,
-                idempotency = IdempotencyContract(ReconciliationMode.HUMAN_INTERVENTION),
+                idempotency = IdempotencyContract(ReconciliationMode.IDEMPOTENT_BY_INVOCATION),
                 agentic = deterministicAgenticDescriptor("repository-model-v1")),
         ) { request ->
             val input = request.input as Value.ObjectValue
             val repository = input.string("repository")
             val commit = input.string("commit")
+            val attempt = modelAttempts.merge(request.invocationId.value, 1, Int::plus)!!
+            if (commit.startsWith("release-fault-") && attempt == 1) return@register listOf(
+                ProviderLifecycleMessage.Failed(Value.ObjectValue(mapOf("class" to Value.StringValue("transient")))),
+            )
             val dependencies = input.strings("dependencies").sorted()
             val files = fixture(repository, commit)
             val entities = files.map { file ->
@@ -267,6 +283,14 @@ object DemoProviders {
             listOf(ProviderLifecycleMessage.Emission(architecture, EmissionId("system-${request.invocationId.value}"), request.invocationId, request.attemptId), ProviderLifecycleMessage.Completed)
         }
         registry.register(
+            ProviderDescriptor(
+                ARCHITECTURE_PUBLICATION, 1, systemArchitectureSchema, publicationSchema,
+                effectClass = EffectClass.EFFECT,
+                idempotency = IdempotencyContract(ReconciliationMode.QUERY_BY_INVOCATION),
+            ),
+            publication,
+        )
+        registry.register(
             ProviderDescriptor(READER, 1, readerInput, snapshot, effectClass = EffectClass.READ),
         ) { request ->
             val input = request.input as Value.ObjectValue
@@ -344,13 +368,32 @@ object DemoProviders {
                 Triple("platform/base", "base-a", emptyList()),
             )
         }
-        return repositories.map { (repository, commit, dependencies) ->
+        return repositories.mapIndexed { index, (repository, commit, dependencies) ->
             Value.ObjectValue(mapOf(
                 "repository" to Value.StringValue(repository),
-                "commit" to Value.StringValue(commit),
+                "commit" to Value.StringValue(if (triggerCommit.startsWith("release-fault-") && index == 0) triggerCommit else commit),
                 "dependencies" to Value.ArrayValue(dependencies.map(Value::StringValue)),
             ))
         }
+    }
+
+    /** Lost-reply fixture: one external write, then reconciliation returns that recorded result. */
+    private class FakeArchitecturePublication : ReconciliationProviderImplementation {
+        private val applied = ConcurrentHashMap<String, Value>()
+
+        override fun invoke(request: io.workflow.provider.ProviderInvocationRequest): Iterable<ProviderLifecycleMessage> {
+            check(!applied.containsKey(request.invocationId.value)) { "duplicate fake publication" }
+            val result = Value.ObjectValue(mapOf(
+                "architecture" to request.input,
+                "externalWrites" to Value.IntegerValue(BigInteger.ONE),
+            ))
+            applied[request.invocationId.value] = result
+            throw IllegalStateException("simulated lost publication reply")
+        }
+
+        override fun reconcile(request: ReconciliationRequest): ReconciliationResult = applied[request.invocationId.value]?.let {
+            ReconciliationResult(disposition = ReconciliationDisposition.DEFINITELY_APPLIED, recordedResult = it)
+        } ?: ReconciliationResult(disposition = ReconciliationDisposition.DEFINITELY_NOT_APPLIED)
     }
 
     private fun Value.ObjectValue.string(name: String): String =

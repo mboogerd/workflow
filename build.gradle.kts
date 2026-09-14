@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "io.workflow"
-version = "0.1.0"
+version = "1.0.0"
 
 repositories { mavenCentral() }
 
@@ -21,3 +21,18 @@ dependencies {
 kotlin { jvmToolchain(21) }
 tasks.test { useJUnitPlatform() }
 application { mainClass.set("io.workflow.ApplicationKt") }
+
+tasks.register<JavaExec>("conformance") {
+    group = "verification"
+    description = "Runs the versioned Workflow v1 conformance corpus."
+    classpath = sourceSets.main.get().runtimeClasspath
+    mainClass.set("io.workflow.conformance.ConformanceKt")
+    args("conformance/v1")
+}
+
+tasks.register<Exec>("distributionSmokeTest") {
+    group = "verification"
+    description = "Validates the generated distribution in a clean directory."
+    dependsOn(tasks.named("installDist"))
+    commandLine("bash", "scripts/distribution-smoke-test.sh", layout.buildDirectory.get().asFile.absolutePath)
+}
