@@ -38,6 +38,7 @@ import io.workflow.provider.ProviderRegistry
 import java.security.MessageDigest
 import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
+import java.util.Collections
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.joinAll
@@ -92,7 +93,7 @@ data class ActivationRecord(
     val discriminatorRevision: AssignmentId? = null,
     val branchTag: String? = null,
 ) {
-    enum class Status { COMPLETED, OPEN, FAILED }
+    enum class Status { COMPLETED, OPEN, FAILED, STOPPED }
 
     val parentMapActivationId: ActivationId? get() = mapActivationId
     val itemIdentity: String? get() = mapItemId
@@ -108,6 +109,7 @@ enum class ProviderEventType {
     EMISSION_REFUSED,
     COMPLETED,
     OPEN,
+    CANCELLED,
     FAILED;
 
     companion object {
@@ -181,6 +183,28 @@ data class ProviderEmission(
     val correlationId: String? = null,
 )
 
+/**
+ * Lifecycle state of a hosted execution. Quiescence means that no currently
+ * runnable work exists; it is deliberately distinct from provider completion
+ * and does not imply that an open provider or context is complete.
+ */
+enum class WorkflowExecutionState {
+    RUNNING,
+    QUIESCENT,
+    STOPPED,
+}
+
+/** A stable handle for an open provider invocation that can receive pushes. */
+data class OpenProviderHandle(
+    val executionId: ExecutionId,
+    val invocationId: InvocationId,
+    val attemptId: AttemptId,
+    val producerId: ProducerId,
+    val providerId: String,
+    val providerVersion: Int,
+    val contextId: ContextId,
+)
+
 fun interface ProviderInvoker {
     fun invoke(invocation: ProviderInvocation): Iterable<ProviderEmission>
 }
@@ -218,6 +242,7 @@ class InMemoryJournalStore(
     private val currentAssignments = linkedMapOf<RegisterKey, AssignmentMutation>()
     private val activationIntents = linkedMapOf<ActivationIntentId, ActivationIntent>()
     private val completedIntentIds = linkedSetOf<ActivationIntentId>()
+    private val stoppedIntentIds = linkedSetOf<ActivationIntentId>()
     private val claimedIntentIds = linkedSetOf<ActivationIntentId>()
     private val openIntentIds = linkedSetOf<ActivationIntentId>()
     private val deferredIntentIds = linkedSetOf<ActivationIntentId>()
@@ -388,6 +413,7 @@ class InMemoryJournalStore(
         activationIntents.values.firstOrNull {
             it.executionId == executionId &&
                 it.id !in completedIntentIds &&
+                it.id !in stoppedIntentIds &&
                 it.id !in claimedIntentIds &&
                 it.id !in openIntentIds &&
                 it.id !in deferredIntentIds
@@ -400,7 +426,36 @@ class InMemoryJournalStore(
         openIntentIds -= intentId
         deferredIntentIds -= intentId
         deferredRequirements.remove(intentId)
+        stoppedIntentIds -= intentId
         completedIntentIds += intentId
+    }
+
+    /**
+     * Administratively stop one activation. Stopping is an operational fact;
+     * it does not append a register assignment or a provider completion event.
+     */
+    fun stopActivation(intentId: ActivationIntentId) = synchronized(lock) {
+        require(intentId in activationIntents) { "cannot stop an unknown activation intent" }
+        require(intentId !in completedIntentIds) { "cannot stop a completed activation intent" }
+        claimedIntentIds -= intentId
+        openIntentIds -= intentId
+        deferredIntentIds -= intentId
+        deferredRequirements.remove(intentId)
+        stoppedIntentIds += intentId
+    }
+
+    /** Stop every unfinished activation belonging to one hosted execution. */
+    fun stopExecution(executionId: ExecutionId) = synchronized(lock) {
+        val unfinished = activationIntents.values.filter {
+            it.executionId == executionId && it.id !in completedIntentIds
+        }
+        unfinished.forEach { intent ->
+            claimedIntentIds -= intent.id
+            openIntentIds -= intent.id
+            deferredIntentIds -= intent.id
+            deferredRequirements.remove(intent.id)
+            stoppedIntentIds += intent.id
+        }
     }
 
     /** Return an in-flight claim to the durable queue after an unhandled worker error. */
@@ -443,12 +498,15 @@ class InMemoryJournalStore(
         activationIntents.values.any {
             it.executionId == executionId &&
                 it.id !in completedIntentIds &&
+                it.id !in stoppedIntentIds &&
                 it.id !in openIntentIds &&
                 it.id !in deferredIntentIds
         }
     }
 
     fun isOpen(intentId: ActivationIntentId): Boolean = synchronized(lock) { intentId in openIntentIds }
+
+    fun isStopped(intentId: ActivationIntentId): Boolean = synchronized(lock) { intentId in stoppedIntentIds }
 
     fun recordActivation(record: ActivationRecord) = synchronized(lock) {
         val intent = activationIntents[record.intentId]
@@ -659,8 +717,13 @@ data class WorkflowRunResult(
     val outputs: Map<String, PublishedOutput>,
     val journal: InMemoryJournalStore,
     val failures: List<String> = emptyList(),
+    /** State observed when this result snapshot was produced. */
+    val executionState: WorkflowExecutionState = WorkflowExecutionState.QUIESCENT,
 ) {
     val isSuccessful: Boolean get() = failures.isEmpty()
+    val state: WorkflowExecutionState get() = executionState
+    val isQuiescent: Boolean get() = executionState == WorkflowExecutionState.QUIESCENT
+    val isStopped: Boolean get() = executionState == WorkflowExecutionState.STOPPED
     val providerEvents: List<ProviderLifecycleEvent>
         get() = journal.providerEvents().filter { it.executionId == executionId }
 
@@ -671,7 +734,11 @@ data class WorkflowRunResult(
                 "revision" to JsonPrimitive(output.revision),
             ))
         }
-        return JsonObject(mapOf("outputs" to JsonObject(outputObject))).toString()
+        return JsonObject(linkedMapOf(
+            "executionState" to JsonPrimitive(executionState.name.lowercase()),
+            "quiescent" to JsonPrimitive(isQuiescent),
+            "outputs" to JsonObject(outputObject),
+        )).toString()
     }
 
     fun inspectionJson(): String = WorkflowInspection.toJson(this)
@@ -691,6 +758,49 @@ private data class EvaluationScope(
     val lexicalBindings: Map<String, Value> = emptyMap(),
 )
 
+/**
+ * Handle returned by [InMemoryWorkflowRunner.start]. The initial invocation is
+ * driven to quiescence before this method returns. Open providers can then be
+ * driven with bounded calls to [emit], [complete], or [stop].
+ */
+class HostedWorkflowExecution internal constructor(
+    private val runner: InMemoryWorkflowRunner,
+    val executionId: ExecutionId,
+) {
+    val state: WorkflowExecutionState get() = runner.executionState(executionId)
+    val status: WorkflowExecutionState get() = state
+    val isQuiescent: Boolean get() = state == WorkflowExecutionState.QUIESCENT
+    val isStopped: Boolean get() = state == WorkflowExecutionState.STOPPED
+    val quiescent: Boolean get() = isQuiescent
+
+    fun result(): WorkflowRunResult = runner.result(executionId)
+    fun runUntilQuiescent(): WorkflowRunResult = runner.runUntilQuiescent(executionId)
+    fun resume(): WorkflowRunResult = runUntilQuiescent()
+    fun openProviders(): List<OpenProviderHandle> = runner.openProviders(executionId)
+
+    fun emit(emission: ProviderEmission): WorkflowRunResult = runner.emit(executionId, emission)
+
+    fun emit(emission: ProviderLifecycleMessage.Emission): WorkflowRunResult =
+        runner.emit(executionId, emission)
+
+    fun emit(invocationId: InvocationId, emission: ProviderEmission): WorkflowRunResult =
+        runner.emit(executionId, invocationId, emission)
+
+    fun emit(
+        invocationId: InvocationId,
+        value: Value,
+        emissionId: EmissionId,
+        correlationId: String? = null,
+    ): WorkflowRunResult = emit(invocationId, ProviderEmission(value, emissionId, correlationId))
+
+    fun complete(invocationId: InvocationId): WorkflowRunResult = runner.complete(executionId, invocationId)
+    fun complete(): WorkflowRunResult = runner.complete(executionId)
+    fun fail(invocationId: InvocationId, error: Value): WorkflowRunResult = runner.fail(executionId, invocationId, error)
+    fun stop(): WorkflowRunResult = runner.stop(executionId)
+    fun cancel(): WorkflowRunResult = stop()
+    fun administrativeStop(): WorkflowRunResult = stop()
+}
+
 /** Executes expression IR against the in-memory journal until no intent is runnable. */
 class InMemoryWorkflowRunner(
     private val compiler: WorkflowCompiler = WorkflowCompiler(),
@@ -703,6 +813,29 @@ class InMemoryWorkflowRunner(
 ) {
     private val assignmentCommitLock = Any()
     private val mapActivations = ConcurrentHashMap<ActivationId, MapActivationState>()
+    private val sessions = ConcurrentHashMap<ExecutionId, ExecutionSession>()
+
+    private data class OpenProviderState(
+        val workflow: WorkflowIrDocument,
+        val intent: ActivationIntent,
+        val register: CompiledRegister,
+        val invocationId: InvocationId,
+        val attemptId: AttemptId,
+        val startedAt: Instant,
+        val seenEmissionIds: MutableSet<EmissionId>,
+        val lock: Any = Any(),
+    )
+
+    private class ExecutionSession(
+        val workflow: WorkflowIrDocument,
+        val parameters: Map<String, Value>,
+        val executionId: ExecutionId,
+        var beforeActivation: (ActivationIntent) -> Unit,
+    ) {
+        val failures: MutableList<String> = Collections.synchronizedList(mutableListOf())
+        val openProviders = ConcurrentHashMap<InvocationId, OpenProviderState>()
+        @Volatile var state: WorkflowExecutionState = WorkflowExecutionState.RUNNING
+    }
 
     constructor(providerRegistry: ProviderRegistry) : this(
         compiler = WorkflowCompiler(providerRegistry),
@@ -730,6 +863,25 @@ class InMemoryWorkflowRunner(
         return execute(compilation.ir!!, parameters, executionId, beforeActivation)
     }
 
+    /** Start and initially drive a hosted execution to its first quiescent point. */
+    fun start(
+        yamlText: String,
+        parameters: Map<String, Value> = emptyMap(),
+        executionId: ExecutionId = nextExecutionId(),
+        beforeActivation: (ActivationIntent) -> Unit = {},
+    ): HostedWorkflowExecution {
+        val compilation = compile(yamlText)
+        if (!compilation.isValid) throw WorkflowExecutionException(compilation.diagnostics.joinToString("\n"))
+        return start(compilation.ir!!, parameters, executionId, beforeActivation)
+    }
+
+    fun host(
+        yamlText: String,
+        parameters: Map<String, Value> = emptyMap(),
+        executionId: ExecutionId = nextExecutionId(),
+        beforeActivation: (ActivationIntent) -> Unit = {},
+    ): HostedWorkflowExecution = start(yamlText, parameters, executionId, beforeActivation)
+
     private fun compile(yamlText: String) = if (providerRegistry !== compiler.providerRegistry && compiler.providerRegistry.isEmpty()) {
         WorkflowCompiler(providerRegistry).compile(yamlText)
     } else {
@@ -741,7 +893,15 @@ class InMemoryWorkflowRunner(
         parameters: Map<String, Value> = emptyMap(),
         executionId: ExecutionId = nextExecutionId(),
         beforeActivation: (ActivationIntent) -> Unit = {},
-    ): WorkflowRunResult {
+    ): WorkflowRunResult = start(workflow, parameters, executionId, beforeActivation).result()
+
+    /** Start and initially drive a precompiled workflow to quiescence. */
+    fun start(
+        workflow: WorkflowIrDocument,
+        parameters: Map<String, Value> = emptyMap(),
+        executionId: ExecutionId = nextExecutionId(),
+        beforeActivation: (ActivationIntent) -> Unit = {},
+    ): HostedWorkflowExecution {
         validateParameters(workflow, parameters)
         val boundParameters = journal.bindExecution(
             executionId,
@@ -749,24 +909,338 @@ class InMemoryWorkflowRunner(
             workflow.contentHash,
             parameters,
         )
+        val session = sessions.compute(executionId) { _, existing ->
+            if (existing == null) {
+                ExecutionSession(workflow, boundParameters, executionId, beforeActivation)
+            } else {
+                require(existing.workflow.workflowVersionId == workflow.workflowVersionId && existing.workflow.contentHash == workflow.contentHash) {
+                    "execution id is already hosted with different workflow content"
+                }
+                require(existing.parameters == boundParameters) {
+                    "execution id is already hosted with different parameters"
+                }
+                existing.beforeActivation = beforeActivation
+                existing
+            }
+        }!!
         val contextId = ContextId(ANONYMOUS_CONTEXT)
         journal.persistActivationIntents(
             planner.initial(workflow, executionId, contextId, JournalBatchId(STARTUP_BATCH), clock.now()),
         )
         journal.wakeDeferredActivations(executionId)
 
-        val failures = mutableListOf<String>()
-        runWorkers(workflow, boundParameters, executionId, beforeActivation, failures)
+        val hosted = HostedWorkflowExecution(this, executionId)
+        runUntilQuiescent(session)
+        return hosted
+    }
 
-        val outputs = workflow.outputs.mapNotNull { outputName ->
-            val register = workflow.registers.first { it.name == outputName }
-            val assignment = journal.current(RegisterKey(executionId, contextId, register.registerId))
-            if (assignment == null && failures.isEmpty() && register.compiledProducer is CompiledProducer.Expression) {
+    fun host(
+        workflow: WorkflowIrDocument,
+        parameters: Map<String, Value> = emptyMap(),
+        executionId: ExecutionId = nextExecutionId(),
+        beforeActivation: (ActivationIntent) -> Unit = {},
+    ): HostedWorkflowExecution = start(workflow, parameters, executionId, beforeActivation)
+
+    /** Drive a known execution until no currently runnable activation remains. */
+    fun runUntilQuiescent(executionId: ExecutionId): WorkflowRunResult {
+        val session = sessions[executionId]
+            ?: throw WorkflowExecutionException("execution '${executionId.value}' is not hosted")
+        runUntilQuiescent(session)
+        return result(session)
+    }
+
+    private fun runUntilQuiescent(session: ExecutionSession) {
+        if (session.state == WorkflowExecutionState.STOPPED) return
+        session.state = WorkflowExecutionState.RUNNING
+        journal.wakeDeferredActivations(session.executionId)
+        runWorkers(
+            session.workflow,
+            session.parameters,
+            session.executionId,
+            session.beforeActivation,
+            session.failures,
+            session,
+        )
+        if (session.state != WorkflowExecutionState.STOPPED) session.state = WorkflowExecutionState.QUIESCENT
+    }
+
+    fun executionState(executionId: ExecutionId): WorkflowExecutionState =
+        sessions[executionId]?.state
+            ?: throw WorkflowExecutionException("execution '${executionId.value}' is not hosted")
+
+    fun result(executionId: ExecutionId): WorkflowRunResult =
+        sessions[executionId]?.let(::result)
+            ?: throw WorkflowExecutionException("execution '${executionId.value}' is not hosted")
+
+    fun openProviders(executionId: ExecutionId): List<OpenProviderHandle> =
+        sessions[executionId]?.openProviders?.values?.map { state ->
+            OpenProviderHandle(
+                executionId = executionId,
+                invocationId = state.invocationId,
+                attemptId = state.attemptId,
+                producerId = state.register.producerId,
+                providerId = state.register.provider?.providerId ?: "",
+                providerVersion = state.register.provider?.version ?: 0,
+                contextId = state.intent.contextId,
+            )
+        }?.sortedBy { it.invocationId.value }
+            ?: throw WorkflowExecutionException("execution '${executionId.value}' is not hosted")
+
+    /** Push an emission to the only open provider in an execution. */
+    fun emit(executionId: ExecutionId, emission: ProviderEmission): WorkflowRunResult {
+        val session = sessions[executionId]
+            ?: throw WorkflowExecutionException("execution '${executionId.value}' is not hosted")
+        val open = session.openProviders.values.singleOrNull()
+            ?: throw WorkflowExecutionException(
+                if (session.openProviders.isEmpty()) "execution '${executionId.value}' has no open provider"
+                else "execution '${executionId.value}' has multiple open providers; specify invocation id",
+            )
+        return emit(executionId, open.invocationId, emission)
+    }
+
+    fun emit(executionId: ExecutionId, message: ProviderLifecycleMessage.Emission): WorkflowRunResult {
+        val state = sessions[executionId]?.openProviders?.get(message.invocationId)
+            ?: throw WorkflowExecutionException("open provider invocation '${message.invocationId.value}' is not found")
+        require(message.attemptId == state.attemptId) {
+            "provider emission attempt id ${message.attemptId.value} does not match ${state.attemptId.value}"
+        }
+        return emit(
+            executionId,
+            message.invocationId,
+            ProviderEmission(message.value, message.emissionId, message.correlationId),
+        )
+    }
+
+    fun emit(
+        executionId: ExecutionId,
+        value: Value,
+        emissionId: EmissionId,
+        correlationId: String? = null,
+    ): WorkflowRunResult = emit(executionId, ProviderEmission(value, emissionId, correlationId))
+
+    /** Push an emission to a particular open provider invocation. */
+    fun emit(executionId: ExecutionId, invocationId: InvocationId, emission: ProviderEmission): WorkflowRunResult {
+        val session = sessions[executionId]
+            ?: throw WorkflowExecutionException("execution '${executionId.value}' is not hosted")
+        val state = session.openProviders[invocationId]
+            ?: throw WorkflowExecutionException("open provider invocation '${invocationId.value}' is not found")
+        synchronized(state.lock) {
+            require(session.state != WorkflowExecutionState.STOPPED) { "execution '${executionId.value}' is stopped" }
+            require(journal.isOpen(state.intent.id)) { "provider invocation '${invocationId.value}' is not open" }
+            val message = ProviderLifecycleMessage.Emission(
+                value = emission.value,
+                emissionId = emission.emissionId,
+                invocationId = invocationId,
+                attemptId = state.attemptId,
+                correlationId = emission.correlationId,
+            )
+            val descriptor = providerRegistry.resolve(state.register.provider!!.providerId, state.register.provider.version)!!.descriptor
+            val received = recordProviderEvent(
+                state.workflow,
+                state.intent,
+                invocationId,
+                state.attemptId,
+                ProviderEventType.EMISSION_RECEIVED,
+                causationId = "open-${state.intent.id.value}",
+                register = state.register,
+                emissionId = message.emissionId,
+                value = message.value,
+                correlationId = message.correlationId,
+            )
+            val validationFailure = validateEmission(
+                descriptor,
+                state.register,
+                message,
+                invocationId,
+                state.attemptId,
+                state.seenEmissionIds,
+            ) ?: when {
+                message.correlationId?.isBlank() == true ->
+                    "PROTOCOL_INVALID_CORRELATION: correlation id must not be blank"
+                state.intent.mapActivationId != null && message.correlationId != null ->
+                    "PROTOCOL_INVALID_CORRELATION: map item providers cannot route emissions outside their item context"
+                else -> null
+            }
+            if (validationFailure != null) {
+                refusal(
+                    state.workflow,
+                    state.intent,
+                    state.register,
+                    invocationId,
+                    state.attemptId,
+                    received.eventId,
+                    message,
+                    validationFailure,
+                )
+                session.openProviders.remove(invocationId)
+                recordActivation(
+                    state.intent,
+                    ActivationRecord.Status.FAILED,
+                    state.startedAt,
+                    validationFailure,
+                    invocationId,
+                    state.attemptId,
+                )
+                journal.completeActivation(state.intent.id)
+                synchronized(session.failures) { session.failures += "${state.register.name}: $validationFailure" }
+            } else {
+                state.seenEmissionIds += message.emissionId
+                commitOpenEmission(state, message, received.eventId)
+                recordProviderEvent(
+                    state.workflow,
+                    state.intent,
+                    invocationId,
+                    state.attemptId,
+                    ProviderEventType.EMISSION_ACCEPTED,
+                    causationId = received.eventId,
+                    register = state.register,
+                    emissionId = message.emissionId,
+                    value = message.value,
+                    correlationId = message.correlationId,
+                )
+            }
+        }
+        return runUntilQuiescent(executionId)
+    }
+
+    /** Mark one open provider complete without fabricating another assignment. */
+    fun complete(executionId: ExecutionId, invocationId: InvocationId): WorkflowRunResult {
+        val session = sessions[executionId]
+            ?: throw WorkflowExecutionException("execution '${executionId.value}' is not hosted")
+        val state = session.openProviders[invocationId]
+            ?: throw WorkflowExecutionException("open provider invocation '${invocationId.value}' is not found")
+        synchronized(state.lock) {
+            require(session.state != WorkflowExecutionState.STOPPED) { "execution '${executionId.value}' is stopped" }
+            require(journal.isOpen(state.intent.id)) { "provider invocation '${invocationId.value}' is not open" }
+            val descriptor = providerRegistry.resolve(state.register.provider!!.providerId, state.register.provider.version)!!.descriptor
+            if (!descriptor.lifecycle.completes) {
+                val diagnostic = "PROTOCOL_UNSUPPORTED_COMPLETION: provider descriptor does not allow completion"
+                recordProviderEvent(state.workflow, state.intent, invocationId, state.attemptId, ProviderEventType.FAILED,
+                    causationId = "open-${state.intent.id.value}", register = state.register, diagnostic = diagnostic)
+                session.openProviders.remove(invocationId)
+                recordActivation(state.intent, ActivationRecord.Status.FAILED, state.startedAt, diagnostic, invocationId, state.attemptId)
+                journal.completeActivation(state.intent.id)
+                synchronized(session.failures) { session.failures += "${state.register.name}: $diagnostic" }
+            } else {
+                recordProviderEvent(state.workflow, state.intent, invocationId, state.attemptId, ProviderEventType.COMPLETED,
+                    causationId = "open-${state.intent.id.value}", register = state.register)
+                session.openProviders.remove(invocationId)
+                recordActivation(state.intent, ActivationRecord.Status.COMPLETED, state.startedAt, null, invocationId, state.attemptId)
+                journal.completeActivation(state.intent.id)
+            }
+        }
+        return runUntilQuiescent(executionId)
+    }
+
+    fun complete(executionId: ExecutionId): WorkflowRunResult {
+        val open = sessions[executionId]?.openProviders?.values?.singleOrNull()
+            ?: throw WorkflowExecutionException("execution '${executionId.value}' does not have exactly one open provider")
+        return complete(executionId, open.invocationId)
+    }
+
+    /** Record a provider failure for an open invocation without assigning data. */
+    fun fail(executionId: ExecutionId, invocationId: InvocationId, error: Value): WorkflowRunResult {
+        val session = sessions[executionId]
+            ?: throw WorkflowExecutionException("execution '${executionId.value}' is not hosted")
+        val state = session.openProviders[invocationId]
+            ?: throw WorkflowExecutionException("open provider invocation '${invocationId.value}' is not found")
+        synchronized(state.lock) {
+            require(session.state != WorkflowExecutionState.STOPPED) { "execution '${executionId.value}' is stopped" }
+            require(journal.isOpen(state.intent.id)) { "provider invocation '${invocationId.value}' is not open" }
+            val descriptor = providerRegistry.resolve(state.register.provider!!.providerId, state.register.provider.version)!!.descriptor
+            val diagnostic = if (descriptor.errorSchema.validate(error).isValid) {
+                "PROVIDER_FAILURE: ${CanonicalValueJson.encode(error)}"
+            } else {
+                "PROTOCOL_INVALID_ERROR: ${descriptor.errorSchema.validate(error).errors.joinToString { "${it.path}: ${it.message}" }}"
+            }
+            recordProviderEvent(
+                state.workflow,
+                state.intent,
+                invocationId,
+                state.attemptId,
+                ProviderEventType.FAILED,
+                causationId = "open-${state.intent.id.value}",
+                register = state.register,
+                error = error,
+                diagnostic = diagnostic,
+            )
+            session.openProviders.remove(invocationId)
+            recordActivation(state.intent, ActivationRecord.Status.FAILED, state.startedAt, diagnostic, invocationId, state.attemptId)
+            journal.completeActivation(state.intent.id)
+            synchronized(session.failures) { session.failures += "${state.register.name}: $diagnostic" }
+        }
+        return runUntilQuiescent(executionId)
+    }
+
+    fun fail(executionId: ExecutionId, error: Value): WorkflowRunResult {
+        val open = sessions[executionId]?.openProviders?.values?.singleOrNull()
+            ?: throw WorkflowExecutionException("execution '${executionId.value}' does not have exactly one open provider")
+        return fail(executionId, open.invocationId, error)
+    }
+
+    /** Stop a hosted execution without completing providers or assigning values. */
+    fun stop(executionId: ExecutionId): WorkflowRunResult {
+        val session = sessions[executionId]
+            ?: throw WorkflowExecutionException("execution '${executionId.value}' is not hosted")
+        if (session.state == WorkflowExecutionState.STOPPED) return result(session)
+        session.openProviders.values.toList().forEach { state ->
+            synchronized(state.lock) {
+                if (journal.isOpen(state.intent.id)) {
+                    recordProviderEvent(
+                        state.workflow,
+                        state.intent,
+                        state.invocationId,
+                        state.attemptId,
+                        ProviderEventType.CANCELLED,
+                        causationId = "admin-stop-${executionId.value}",
+                        register = state.register,
+                        diagnostic = "ADMINISTRATIVE_STOP",
+                    )
+                    recordActivation(
+                        state.intent,
+                        ActivationRecord.Status.STOPPED,
+                        state.startedAt,
+                        "ADMINISTRATIVE_STOP",
+                        state.invocationId,
+                        state.attemptId,
+                    )
+                }
+            }
+        }
+        journal.stopExecution(executionId)
+        session.openProviders.clear()
+        session.state = WorkflowExecutionState.STOPPED
+        return result(session)
+    }
+
+    fun cancel(executionId: ExecutionId): WorkflowRunResult = stop(executionId)
+
+    fun administrativeStop(executionId: ExecutionId): WorkflowRunResult = stop(executionId)
+
+    fun stopExecution(executionId: ExecutionId): WorkflowRunResult = stop(executionId)
+
+    fun cancelExecution(executionId: ExecutionId): WorkflowRunResult = stop(executionId)
+
+    private fun result(session: ExecutionSession): WorkflowRunResult {
+        val contextId = ContextId(ANONYMOUS_CONTEXT)
+        val outputs = session.workflow.outputs.mapNotNull { outputName ->
+            val register = session.workflow.registers.first { it.name == outputName }
+            val assignment = journal.current(RegisterKey(session.executionId, contextId, register.registerId))
+            if (assignment == null && session.failures.isEmpty() &&
+                register.compiledProducer is CompiledProducer.Expression &&
+                session.openProviders.isEmpty() && session.state != WorkflowExecutionState.STOPPED
+            ) {
                 throw WorkflowExecutionException("output '$outputName' received no assignment")
             }
             assignment?.let { outputName to PublishedOutput(it.value, it.revision) }
         }.toMap()
-        return WorkflowRunResult(executionId, outputs, journal, failures)
+        return WorkflowRunResult(
+            session.executionId,
+            outputs,
+            journal,
+            synchronized(session.failures) { session.failures.toList() },
+            session.state,
+        )
     }
 
     /** Run ready activations on a bounded coroutine dispatcher until the queue quiesces. */
@@ -776,6 +1250,7 @@ class InMemoryWorkflowRunner(
         executionId: ExecutionId,
         beforeActivation: (ActivationIntent) -> Unit,
         failures: MutableList<String>,
+        session: ExecutionSession,
     ) {
         val executor = Executors.newFixedThreadPool(workerCount)
         val dispatcher = executor.asCoroutineDispatcher()
@@ -785,7 +1260,7 @@ class InMemoryWorkflowRunner(
                     val active = AtomicInteger(0)
                     val workers = List(workerCount) {
                         launch {
-                            workerLoop(workflow, parameters, executionId, beforeActivation, failures, active)
+                            workerLoop(workflow, parameters, executionId, beforeActivation, failures, active, session)
                         }
                     }
                     workers.joinAll()
@@ -804,6 +1279,7 @@ class InMemoryWorkflowRunner(
         beforeActivation: (ActivationIntent) -> Unit,
         failures: MutableList<String>,
         active: AtomicInteger,
+        session: ExecutionSession,
     ) {
         while (true) {
             val intent = journal.claimNextActivation(executionId)
@@ -822,7 +1298,7 @@ class InMemoryWorkflowRunner(
                     journal.releaseActivation(intent.id)
                     throw failure
                 }
-                processActivation(workflow, parameters, intent, failures)?.let { failure ->
+                processActivation(workflow, parameters, intent, failures, session)?.let { failure ->
                     synchronized(failures) { failures += failure }
                 }
             } finally {
@@ -836,6 +1312,7 @@ class InMemoryWorkflowRunner(
         parameters: Map<String, Value>,
         intent: ActivationIntent,
         failures: MutableList<String>,
+        session: ExecutionSession,
     ): String? {
         val register = resolveProducer(workflow, intent.producerId)
             ?: throw WorkflowExecutionException("activation refers to unknown producer ${intent.producerId.value}")
@@ -883,7 +1360,19 @@ class InMemoryWorkflowRunner(
                     ProviderActivationStatus.OPEN -> ActivationRecord.Status.OPEN
                 }
                 recordActivation(intent, status, started, result.failure, result.invocationId, result.attemptId)
-                if (status == ActivationRecord.Status.OPEN) journal.keepActivationOpen(intent.id)
+                if (status == ActivationRecord.Status.OPEN) {
+                    journal.keepActivationOpen(intent.id)
+                    session.openProviders[result.invocationId] = OpenProviderState(
+                        workflow = workflow,
+                        intent = intent,
+                        register = register,
+                        invocationId = result.invocationId,
+                        attemptId = result.attemptId
+                            ?: throw WorkflowExecutionException("open provider '${register.name}' has no attempt id"),
+                        startedAt = started,
+                        seenEmissionIds = result.emissionIds.toMutableSet(),
+                    )
+                }
                 else journal.completeActivation(intent.id)
                 if (status != ActivationRecord.Status.OPEN) {
                     intent.mapActivationId?.let { mapActivations[it]?.itemFinished(intent, result.failure) }
@@ -1071,6 +1560,7 @@ class InMemoryWorkflowRunner(
         val invocationId: InvocationId,
         val attemptId: AttemptId?,
         val failure: String? = null,
+        val emissionIds: Set<EmissionId> = emptySet(),
     )
 
     private data class MapItem(
@@ -1730,6 +2220,7 @@ class InMemoryWorkflowRunner(
             invocationId,
             attemptId,
             terminalFailure,
+            seenEmissionIds.toSet(),
         )
     }
 
@@ -1949,6 +2440,27 @@ class InMemoryWorkflowRunner(
     private fun validateOutput(register: CompiledRegister, value: Value) {
         val validation = register.schema.validate(value)
         if (!validation.isValid) throw BindingFailure(validation.errors.joinToString { "${it.path}: ${it.message}" })
+    }
+
+    private fun commitOpenEmission(
+        state: OpenProviderState,
+        message: ProviderLifecycleMessage.Emission,
+        causationId: String,
+    ) {
+        val targetContext = message.correlationId?.let(::ContextId) ?: state.intent.contextId
+        commitAssignment(
+            workflow = state.workflow,
+            intent = state.intent,
+            register = state.register,
+            value = message.value,
+            invocationId = state.invocationId,
+            emissionId = message.emissionId,
+            causationId = causationId,
+            contextId = targetContext,
+            targetRegisterId = state.intent.targetRegisterId,
+            parentActivationId = state.intent.parentActivationId,
+            discriminatorRevision = state.intent.discriminatorRevision,
+        )
     }
 
     private fun commitAssignment(
@@ -2238,6 +2750,7 @@ private object WorkflowInspection {
         val intents = journal.activationIntents().filter { it.executionId == result.executionId }.map { intent ->
             val state = when {
                 journal.isCompleted(intent.id) -> "completed"
+                journal.isStopped(intent.id) -> "stopped"
                 journal.isOpen(intent.id) -> "open"
                 else -> "pending"
             }
@@ -2285,8 +2798,26 @@ private object WorkflowInspection {
             JsonObject(fields)
         }
         val outputObject = Json.parseToJsonElement(result.outputsJson()) as JsonObject
+        val contextIds = linkedSetOf(ContextId(InMemoryWorkflowRunner.ANONYMOUS_CONTEXT))
+        contextIds += journal.assignments().filter { it.executionId == result.executionId }.map { it.contextId }
+        contextIds += journal.activationIntents().filter { it.executionId == result.executionId }.map { it.contextId }
+        val contexts = contextIds.toList().sortedBy { it.value }.map { contextId ->
+            val fields = linkedMapOf<String, JsonElement>(
+                "contextId" to JsonPrimitive(contextId.value),
+                "kind" to JsonPrimitive(
+                    if (contextId.value == InMemoryWorkflowRunner.ANONYMOUS_CONTEXT) "anonymous" else "correlated",
+                ),
+            )
+            if (contextId.value != InMemoryWorkflowRunner.ANONYMOUS_CONTEXT) {
+                fields["correlationId"] = JsonPrimitive(contextId.value)
+            }
+            JsonObject(fields)
+        }
         return JsonObject(linkedMapOf(
             "executionId" to JsonPrimitive(result.executionId.value),
+            "executionState" to JsonPrimitive(result.executionState.name.lowercase()),
+            "quiescent" to JsonPrimitive(result.isQuiescent),
+            "contexts" to JsonArray(contexts),
             "outputs" to outputObject["outputs"]!!,
             "batches" to JsonArray(batches),
             "assignments" to JsonArray(journal.assignments().filter { it.executionId == result.executionId }.map(::assignmentJson)),
