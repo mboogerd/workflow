@@ -8,10 +8,12 @@ import io.workflow.core.ExecutionId
 import io.workflow.core.Value
 import io.workflow.core.ValueSchema
 import io.workflow.provider.EffectClass
+import io.workflow.provider.IdempotencyContract
 import io.workflow.provider.ProviderDescriptor
 import io.workflow.provider.ProviderImplementation
 import io.workflow.provider.ProviderLifecycleMessage
 import io.workflow.provider.ProviderRegistry
+import io.workflow.provider.ReconciliationMode
 import java.nio.file.Path
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicInteger
@@ -140,7 +142,9 @@ class RetryPolicyTest {
     ) = ProviderRegistry().also { providers ->
         providers.register(
             ProviderDescriptor("retry-provider", 1, ValueSchema.Any, ValueSchema.String,
-                configurationSchema = ValueSchema.Any, effectClass = effectClass),
+                configurationSchema = ValueSchema.Any, effectClass = effectClass,
+                idempotency = if (effectClass in setOf(EffectClass.EFFECT, EffectClass.AGENTIC))
+                    IdempotencyContract(ReconciliationMode.HUMAN_INTERVENTION) else null),
             implementation,
         )
     }

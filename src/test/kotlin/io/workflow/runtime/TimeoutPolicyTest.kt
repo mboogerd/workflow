@@ -8,11 +8,13 @@ import io.workflow.core.Value
 import io.workflow.core.ValueSchema
 import io.workflow.provider.CancellableProviderImplementation
 import io.workflow.provider.EffectClass
+import io.workflow.provider.IdempotencyContract
 import io.workflow.provider.ProviderDescriptor
 import io.workflow.provider.ProviderInvocationRequest
 import io.workflow.provider.ProviderLifecycle
 import io.workflow.provider.ProviderLifecycleMessage
 import io.workflow.provider.ProviderRegistry
+import io.workflow.provider.ReconciliationMode
 import java.time.Instant
 import java.util.concurrent.CountDownLatch
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -150,6 +152,8 @@ class TimeoutPolicyTest {
             ProviderDescriptor("timed-provider", 1, ValueSchema.Any, ValueSchema.String,
                 configurationSchema = ValueSchema.Any,
                 effectClass = effectClass,
+                idempotency = if (effectClass in setOf(EffectClass.EFFECT, EffectClass.AGENTIC))
+                    IdempotencyContract(ReconciliationMode.HUMAN_INTERVENTION) else null,
                 lifecycle = ProviderLifecycle(supportsTimeout = true, supportsCancellation = true)),
             implementation,
         )

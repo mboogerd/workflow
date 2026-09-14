@@ -4,10 +4,12 @@ import io.workflow.core.EmissionId
 import io.workflow.core.Value
 import io.workflow.core.ValueSchema
 import io.workflow.provider.EffectClass
+import io.workflow.provider.IdempotencyContract
 import io.workflow.provider.ProviderDescriptor
 import io.workflow.provider.deterministicAgenticDescriptor
 import io.workflow.provider.ProviderLifecycleMessage
 import io.workflow.provider.ProviderRegistry
+import io.workflow.provider.ReconciliationMode
 import java.math.BigInteger
 
 /** Deterministic, offline providers used by the single-repository example. */
@@ -171,7 +173,9 @@ object DemoProviders {
             )
         }
         registry.register(
-            ProviderDescriptor(REPOSITORY_MODEL, 1, repositoryInputSchema, repositoryModelSchema, effectClass = EffectClass.AGENTIC, agentic = deterministicAgenticDescriptor("repository-model-v1")),
+            ProviderDescriptor(REPOSITORY_MODEL, 1, repositoryInputSchema, repositoryModelSchema, effectClass = EffectClass.AGENTIC,
+                idempotency = IdempotencyContract(ReconciliationMode.HUMAN_INTERVENTION),
+                agentic = deterministicAgenticDescriptor("repository-model-v1")),
         ) { request ->
             val input = request.input as Value.ObjectValue
             val repository = input.string("repository")
@@ -279,7 +283,9 @@ object DemoProviders {
             )
         }
         registry.register(
-            ProviderDescriptor(BUILDER, 1, snapshot, modelSchema, effectClass = EffectClass.AGENTIC, agentic = deterministicAgenticDescriptor("builder-v1")),
+            ProviderDescriptor(BUILDER, 1, snapshot, modelSchema, effectClass = EffectClass.AGENTIC,
+                idempotency = IdempotencyContract(ReconciliationMode.HUMAN_INTERVENTION),
+                agentic = deterministicAgenticDescriptor("builder-v1")),
         ) { request ->
             val input = request.input as Value.ObjectValue
             val repository = (input.fields.getValue("repository") as Value.StringValue).value
