@@ -336,6 +336,373 @@ class MapRuntimeTest {
         assertTrue(first.inspectionJson().contains("\"mapInputRevision\""))
     }
 
+    @Test
+    fun `map waits for outer bindings without reactivating for their later revisions`() {
+        val registry = ProviderRegistry().also {
+            it.register(
+                ProviderDescriptor(
+                    "collections",
+                    1,
+                    ValueSchema.Any,
+                    ValueSchema.Array(ValueSchema.String),
+                    ValueSchema.Any,
+                ),
+            ) { request -> listOf(
+                ProviderLifecycleMessage.Emission(
+                    Value.ArrayValue(listOf(Value.StringValue("item"))),
+                    EmissionId("collection"),
+                    request.invocationId,
+                    request.attemptId,
+                ),
+                ProviderLifecycleMessage.Completed,
+            ) }
+            it.register(
+                ProviderDescriptor("prefixes", 1, ValueSchema.Any, ValueSchema.String, ValueSchema.Any),
+            ) { request -> listOf(
+                ProviderLifecycleMessage.Emission(
+                    Value.StringValue("old-"), EmissionId("old-prefix"), request.invocationId, request.attemptId,
+                ),
+                ProviderLifecycleMessage.Emission(
+                    Value.StringValue("new-"), EmissionId("new-prefix"), request.invocationId, request.attemptId,
+                ),
+                ProviderLifecycleMessage.Completed,
+            ) }
+        }
+        val result = InMemoryWorkflowRunner(
+            compiler = WorkflowCompiler(registry),
+            providerRegistry = registry,
+            idSource = DeterministicIdSource("deferred-"),
+            clock = FixedClock(Instant.EPOCH),
+            workerCount = 1,
+        ).run(
+            """
+            workflow:
+              id: deferred-map
+              version: 1
+              context:
+                source: {provider: collections, version: 1}
+                mapped:
+                  map:
+                    over: {${'$'}ref: '${'$'}.source'}
+                    context:
+                      value: {${'$'}concat: [{${'$'}ref: '${'$'}.prefix'}, {${'$'}ref: '${'$'}.item'}]}
+                    output: value
+                prefix:
+                  provider: prefixes
+                  version: 1
+                  with: {${'$'}ref: '${'$'}.source'}
+              outputs: [mapped]
+            """.trimIndent(),
+            executionId = ExecutionId("deferred-map-execution"),
+        )
+
+        assertTrue(result.isSuccessful, result.failures.joinToString())
+        assertEquals(
+            Value.ArrayValue(listOf(Value.StringValue("new-item"))),
+            result.outputs.getValue("mapped").value,
+        )
+        assertEquals(1, result.journal.activationIntents().count {
+            it.producerId.value.endsWith("/producer/mapped")
+        })
+        assertEquals(1, result.journal.assignments().count {
+            it.registerId.value.endsWith("/register/mapped")
+        })
+        val sourceRevision = result.journal.assignments().single {
+            it.registerId.value.endsWith("/register/source")
+        }.assignmentId
+        assertTrue(result.journal.assignments().filter { it.mapItemId != null }.all {
+            it.mapInputRevision == sourceRevision
+        })
+    }
+
+    @Test
+    fun `match nested in a map participates in the item completion barrier`() {
+        val choiceSchema = ValueSchema.TaggedUnion(
+            discriminator = "kind",
+            variants = mapOf(
+                "ok" to ValueSchema.Object(mapOf(
+                    "kind" to ValueSchema.Object.Field(ValueSchema.String),
+                    "value" to ValueSchema.Object.Field(ValueSchema.String),
+                )),
+                "failed" to ValueSchema.Object(mapOf(
+                    "kind" to ValueSchema.Object.Field(ValueSchema.String),
+                    "error" to ValueSchema.Object.Field(ValueSchema.String),
+                )),
+            ),
+        )
+        val registry = ProviderRegistry().also {
+            it.register(
+                ProviderDescriptor("choices", 1, ValueSchema.Any, ValueSchema.Array(choiceSchema), ValueSchema.Any),
+            ) { request -> listOf(
+                ProviderLifecycleMessage.Emission(
+                    Value.ArrayValue(listOf(
+                        Value.ObjectValue(mapOf(
+                            "kind" to Value.StringValue("ok"),
+                            "value" to Value.StringValue("chosen"),
+                        )),
+                        Value.ObjectValue(mapOf(
+                            "kind" to Value.StringValue("failed"),
+                            "error" to Value.StringValue("handled"),
+                        )),
+                    )),
+                    EmissionId("choices"),
+                    request.invocationId,
+                    request.attemptId,
+                ),
+                ProviderLifecycleMessage.Completed,
+            ) }
+        }
+        val result = InMemoryWorkflowRunner(
+            compiler = WorkflowCompiler(registry),
+            providerRegistry = registry,
+            idSource = DeterministicIdSource("nested-match-"),
+            clock = FixedClock(Instant.EPOCH),
+            workerCount = 2,
+        ).run(
+            """
+            workflow:
+              id: nested-match-map
+              version: 1
+              context:
+                source: {provider: choices, version: 1}
+                mapped:
+                  map:
+                    over: {${'$'}ref: '${'$'}.source'}
+                    context:
+                      selected:
+                        schema: string
+                        match:
+                          value: {${'$'}ref: '${'$'}.item'}
+                          cases:
+                            ok: {${'$'}ref: '${'$'}.match.value'}
+                            failed: {${'$'}ref: '${'$'}.match.error'}
+                    output: selected
+              outputs: [mapped]
+            """.trimIndent(),
+            executionId = ExecutionId("nested-match-map-execution"),
+        )
+
+        assertTrue(result.isSuccessful, result.failures.joinToString())
+        assertEquals(
+            Value.ArrayValue(listOf(Value.StringValue("chosen"), Value.StringValue("handled"))),
+            result.outputs.getValue("mapped").value,
+        )
+        assertEquals(ActivationRecord.Status.COMPLETED, parentMapActivation(result).status)
+        val branches = result.journal.activationIntents().filter { it.branchTag != null }
+        assertEquals(2, branches.size)
+        assertTrue(branches.all { it.mapActivationId != null && it.mapItemId != null && it.parentActivationId != null })
+    }
+
+    @Test
+    fun `map does not wait for an outer dependency used only by an unselected match case`() {
+        val registry = ProviderRegistry().also {
+            it.register(
+                ProviderDescriptor("silent", 1, ValueSchema.Any, ValueSchema.String, ValueSchema.Any),
+            ) { listOf(ProviderLifecycleMessage.Completed) }
+        }
+        val result = InMemoryWorkflowRunner(
+            compiler = WorkflowCompiler(registry),
+            providerRegistry = registry,
+            idSource = DeterministicIdSource("unselected-"),
+            clock = FixedClock(Instant.EPOCH),
+            workerCount = 2,
+        ).run(
+            """
+            workflow:
+              id: unselected-map-dependency
+              version: 1
+              parameters:
+                values:
+                  schema:
+                    type: array
+                    items:
+                      type: tagged-union
+                      discriminator: kind
+                      variants:
+                        Ready:
+                          type: object
+                          fields:
+                            kind: {schema: string}
+                            value: {schema: string}
+                        Failed:
+                          type: object
+                          fields:
+                            kind: {schema: string}
+                            error: {schema: string}
+              context:
+                never: {provider: silent, version: 1}
+                mapped:
+                  map:
+                    over: {${'$'}ref: '${'$'}.parameters.values'}
+                    context:
+                      selected:
+                        schema: string
+                        match:
+                          value: {${'$'}ref: '${'$'}.item'}
+                          cases:
+                            Ready: {${'$'}ref: '${'$'}.match.value'}
+                            Failed: {${'$'}ref: '${'$'}.never'}
+                    output: selected
+              outputs: [mapped]
+            """.trimIndent(),
+            mapOf(
+                "values" to Value.ArrayValue(listOf(Value.ObjectValue(mapOf(
+                    "kind" to Value.StringValue("Ready"),
+                    "value" to Value.StringValue("chosen"),
+                )))),
+            ),
+            ExecutionId("unselected-map-dependency-execution"),
+        )
+
+        assertTrue(result.isSuccessful, result.failures.joinToString())
+        assertEquals(
+            Value.ArrayValue(listOf(Value.StringValue("chosen"))),
+            result.outputs.getValue("mapped").value,
+        )
+        assertEquals(ActivationRecord.Status.COMPLETED, parentMapActivation(result).status)
+    }
+
+    @Test
+    fun `selected map item match case resumes when its outer dependency arrives`() {
+        val registry = ProviderRegistry().also {
+            it.register(
+                ProviderDescriptor("late", 1, ValueSchema.String, ValueSchema.String, ValueSchema.Any),
+            ) { request -> listOf(
+                ProviderLifecycleMessage.Emission(
+                    Value.StringValue("-outer"), EmissionId("late"), request.invocationId, request.attemptId,
+                ),
+                ProviderLifecycleMessage.Completed,
+            ) }
+        }
+        val result = InMemoryWorkflowRunner(
+            compiler = WorkflowCompiler(registry),
+            providerRegistry = registry,
+            idSource = DeterministicIdSource("selected-late-"),
+            clock = FixedClock(Instant.EPOCH),
+            workerCount = 1,
+        ).run(
+            """
+            workflow:
+              id: selected-late-map-dependency
+              version: 1
+              parameters:
+                values:
+                  schema:
+                    type: array
+                    items:
+                      type: tagged-union
+                      discriminator: kind
+                      variants:
+                        Ready:
+                          type: object
+                          fields:
+                            kind: {schema: string}
+                            value: {schema: string}
+                        Failed:
+                          type: object
+                          fields:
+                            kind: {schema: string}
+                            error: {schema: string}
+              context:
+                mapped:
+                  map:
+                    over: {${'$'}ref: '${'$'}.parameters.values'}
+                    context:
+                      selected:
+                        schema: string
+                        match:
+                          value: {${'$'}ref: '${'$'}.item'}
+                          cases:
+                            Ready:
+                              ${'$'}concat: [{${'$'}ref: '${'$'}.match.value'}, {${'$'}ref: '${'$'}.late'}]
+                            Failed: {${'$'}ref: '${'$'}.match.error'}
+                    output: selected
+                trigger: trigger
+                late:
+                  provider: late
+                  version: 1
+                  with: {${'$'}ref: '${'$'}.trigger'}
+              outputs: [mapped]
+            """.trimIndent(),
+            mapOf(
+                "values" to Value.ArrayValue(listOf(Value.ObjectValue(mapOf(
+                    "kind" to Value.StringValue("Ready"),
+                    "value" to Value.StringValue("chosen"),
+                )))),
+            ),
+            ExecutionId("selected-late-map-dependency-execution"),
+        )
+
+        assertTrue(result.isSuccessful, result.failures.joinToString())
+        assertEquals(
+            Value.ArrayValue(listOf(Value.StringValue("chosen-outer"))),
+            result.outputs.getValue("mapped").value,
+        )
+        assertEquals(ActivationRecord.Status.COMPLETED, parentMapActivation(result).status)
+    }
+
+    @Test
+    fun `map nested in match retains outer lexical bindings and assignment provenance`() {
+        val result = InMemoryWorkflowRunner(
+            idSource = DeterministicIdSource("match-map-"),
+            clock = FixedClock(Instant.EPOCH),
+            workerCount = 2,
+        ).run(
+            """
+            workflow:
+              id: match-map-runtime
+              version: 1
+              parameters:
+                result:
+                  schema:
+                    type: tagged-union
+                    discriminator: kind
+                    variants:
+                      Ready:
+                        type: object
+                        fields:
+                          kind: {schema: string}
+                          prefix: {schema: string}
+                          items: {schema: {type: array, items: string}}
+              context:
+                handled:
+                  match:
+                    value: {${'$'}ref: '${'$'}.parameters.result'}
+                    cases:
+                      Ready:
+                        map:
+                          over: {${'$'}ref: '${'$'}.match.items'}
+                          context:
+                            value:
+                              ${'$'}concat: [{${'$'}ref: '${'$'}.match.prefix'}, {${'$'}ref: '${'$'}.item'}]
+                          output: value
+              outputs: [handled]
+            """.trimIndent(),
+            mapOf(
+                "result" to Value.ObjectValue(mapOf(
+                    "kind" to Value.StringValue("Ready"),
+                    "prefix" to Value.StringValue("p/"),
+                    "items" to Value.ArrayValue(listOf(Value.StringValue("a"), Value.StringValue("b"))),
+                )),
+            ),
+            ExecutionId("match-map-execution"),
+        )
+
+        assertTrue(result.isSuccessful, result.failures.joinToString())
+        assertEquals(
+            Value.ArrayValue(listOf(Value.StringValue("p/a"), Value.StringValue("p/b"))),
+            result.outputs.getValue("handled").value,
+        )
+        val matchActivation = result.journal.activations().single {
+            it.producerId.value.endsWith("/producer/handled")
+        }
+        val gather = result.journal.assignments().single {
+            it.registerId.value.endsWith("/register/handled")
+        }
+        assertEquals(matchActivation.activationId, gather.parentActivationId)
+        assertTrue(gather.producerId.value.endsWith("/producer/handled/match/case/Ready"))
+    }
+
     private fun expressionMapYaml(): String = """
         workflow:
           id: expression-map
