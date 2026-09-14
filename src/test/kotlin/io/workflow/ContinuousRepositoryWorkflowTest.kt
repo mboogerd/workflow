@@ -1,6 +1,7 @@
 package io.workflow
 
 import io.workflow.compiler.WorkflowCompiler
+import io.workflow.core.CanonicalValueJson
 import io.workflow.core.DeterministicIdSource
 import io.workflow.core.EmissionId
 import io.workflow.core.ExecutionId
@@ -118,6 +119,45 @@ class ContinuousRepositoryWorkflowTest {
         }
     }
 
+    @Test
+    fun `cli survives a real process restart without duplicating completed repository work`() {
+        val database = createTempFile("continuous-process", ".db")
+        database.deleteIfExists()
+        try {
+            val databaseArgument = database.toAbsolutePath().toString()
+            runCli("demo", "continuous-repositories", "start", "--database", databaseArgument)
+            val snapshotA = runCli(
+                "demo", "continuous-repositories", "emit", "--database", databaseArgument,
+                "--event", eventJson("delivery-process-a", "trigger-a"),
+            )
+            CanonicalValueJson.decode(snapshotA)
+            SqliteJournalStore(database).use { store ->
+                assertEquals(1, architectureAssignments(store))
+                assertEquals(3, providerInvocations(store, DemoProviders.REPOSITORY_MODEL))
+            }
+
+            // The source remains open when the first JVM exits. A separate JVM
+            // reconstructs it from SQLite without repeating completed event-A work.
+            CanonicalValueJson.decode(runCli("demo", "continuous-repositories", "resume", "--database", databaseArgument))
+            SqliteJournalStore(database).use { store ->
+                assertEquals(1, architectureAssignments(store))
+                assertEquals(3, providerInvocations(store, DemoProviders.REPOSITORY_MODEL))
+            }
+
+            val snapshotB = runCli(
+                "demo", "continuous-repositories", "emit", "--database", databaseArgument,
+                "--event", eventJson("delivery-process-b", "trigger-b"),
+            )
+            CanonicalValueJson.decode(snapshotB)
+            SqliteJournalStore(database).use { store ->
+                assertEquals(2, architectureAssignments(store))
+                assertEquals(6, providerInvocations(store, DemoProviders.REPOSITORY_MODEL))
+            }
+        } finally {
+            database.deleteIfExists()
+        }
+    }
+
     private fun runner(store: SqliteJournalStore, providers: io.workflow.provider.ProviderRegistry, ids: String) =
         InMemoryWorkflowRunner(
             compiler = WorkflowCompiler(providers), journal = store, providerRegistry = providers,
@@ -126,6 +166,23 @@ class ContinuousRepositoryWorkflowTest {
 
     private fun providerInvocations(store: SqliteJournalStore, provider: String): Int =
         store.providerInvocations().count { it.providerId == provider }
+
+    private fun architectureAssignments(store: SqliteJournalStore): Int =
+        store.assignments().count { it.registerId.value.endsWith("/register/architecture") }
+
+    private fun runCli(vararg arguments: String): String {
+        val java = Path.of(System.getProperty("java.home"), "bin", "java").toString()
+        val command = listOf(java, "-cp", System.getProperty("java.class.path"), "io.workflow.ApplicationKt") + arguments
+        val process = ProcessBuilder(command).directory(Path.of("").toAbsolutePath().toFile()).start()
+        val stdout = process.inputStream.bufferedReader().readText().trim()
+        val stderr = process.errorStream.bufferedReader().readText().trim()
+        assertEquals(0, process.waitFor(), stderr)
+        assertTrue(stdout.startsWith("{"), stdout.take(200))
+        return stdout
+    }
+
+    private fun eventJson(delivery: String, commit: String): String =
+        CanonicalValueJson.encode(mainEvent(delivery, commit))
 
     private fun mainEvent(delivery: String, commit: String) = Value.ObjectValue(mapOf(
         "repository" to Value.StringValue("app/service"),
