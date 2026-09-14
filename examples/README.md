@@ -93,9 +93,11 @@ return execution data, making them suitable for automation.
 
 ## Release demonstration
 
-The continuous demonstration injects repeatable fixture events. The v1 safety
-suite additionally injects a transient model-builder failure and an ambiguous
-fake publication effect: retry uses the stable logical invocation identity, and
-the publication is reconciled from that identity before a retry can occur. The
-fault matrix is executable in `EffectReconciliationTest` and `RetryPolicyTest`;
-it proves one externally visible fake publication after a lost reply.
+The continuous demonstration has a public release-safety fixture. Emit a commit
+whose id starts with `release-fault-` (for example `release-fault-a`) to make one
+model-builder attempt fail transiently and retry with the same invocation, then
+make the fake architecture publication perform one external write and lose its
+reply. Inspection records `retry_scheduled`, `reconciliation_requested`, and
+`reconciliation_decision`; the exported `publication.externalWrites` remains
+exactly `1`. The distribution smoke test runs this command through the installed
+launcher, so this behavior is release evidence rather than only a unit fixture.
