@@ -128,6 +128,96 @@ class CorrelationOpenProviderTest {
     }
 
     @Test
+    fun `downstream provider emissions inherit their correlated activation context`() {
+        val providers = registry { listOf(ProviderLifecycleMessage.Open) }.also { registry ->
+            registry.register(
+                ProviderDescriptor(
+                    providerId = "inheriting-provider",
+                    version = 1,
+                    inputSchema = ValueSchema.String,
+                    emissionSchema = ValueSchema.String,
+                ),
+            ) { request ->
+                listOf(
+                    ProviderLifecycleMessage.Emission(
+                        request.input,
+                        EmissionId("inherited"),
+                        request.invocationId,
+                        request.attemptId,
+                    ),
+                    ProviderLifecycleMessage.Completed,
+                )
+            }
+        }
+        val yaml = """
+            workflow:
+              id: inherited-correlation
+              version: 1
+              context:
+                event: {provider: open-provider, version: 1}
+                inherited:
+                  provider: inheriting-provider
+                  version: 1
+                  with: {${'$'}ref: "${'$'}.event"}
+              outputs: [inherited]
+        """.trimIndent()
+        val runner = InMemoryWorkflowRunner(
+            compiler = WorkflowCompiler(providers),
+            providerRegistry = providers,
+            idSource = DeterministicIdSource("inherit-"),
+            clock = FixedClock(JavaInstant.EPOCH),
+            workerCount = 1,
+        )
+        val host = runner.start(yaml, executionId = ExecutionId("inherited-correlation-execution"))
+
+        host.emit(
+            host.openProviders().single().invocationId,
+            Value.StringValue("keyed"),
+            EmissionId("keyed"),
+            "customer-1",
+        )
+
+        val inherited = host.result().journal.assignments().single {
+            it.registerId.value.endsWith("/register/inherited")
+        }
+        assertEquals("customer-1", inherited.contextId.value)
+        assertEquals(1, host.result().journal.providerInvocations().count {
+            it.producerId.value.endsWith("/producer/event")
+        })
+    }
+
+    @Test
+    fun `inspection distinguishes internal map item contexts from correlations`() {
+        val yaml = """
+            workflow:
+              id: map-inspection
+              version: 1
+              parameters:
+                values:
+                  schema: {type: array, items: string}
+              context:
+                mapped:
+                  map:
+                    over: {${'$'}ref: '${'$'}.parameters.values'}
+                    context:
+                      selected: {${'$'}ref: '${'$'}.item'}
+                    output: selected
+              outputs: [mapped]
+        """.trimIndent()
+        val result = InMemoryWorkflowRunner(
+            idSource = DeterministicIdSource("map-inspection-"),
+            clock = FixedClock(JavaInstant.EPOCH),
+        ).run(
+            yaml,
+            mapOf("values" to Value.ArrayValue(listOf(Value.StringValue("item")))),
+            ExecutionId("map-inspection-execution"),
+        )
+
+        assertTrue(result.inspectionJson().contains("\"kind\":\"map-item\""))
+        assertFalse(result.inspectionJson().contains("\"kind\":\"correlated\""))
+    }
+
+    @Test
     fun `administrative stop does not synthesize provider completion or assignment`() {
         val runner = InMemoryWorkflowRunner(
             compiler = WorkflowCompiler(registry { listOf(ProviderLifecycleMessage.Open) }),

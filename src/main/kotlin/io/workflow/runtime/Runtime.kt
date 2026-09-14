@@ -2801,14 +2801,24 @@ private object WorkflowInspection {
         val contextIds = linkedSetOf(ContextId(InMemoryWorkflowRunner.ANONYMOUS_CONTEXT))
         contextIds += journal.assignments().filter { it.executionId == result.executionId }.map { it.contextId }
         contextIds += journal.activationIntents().filter { it.executionId == result.executionId }.map { it.contextId }
+        val mapItemContextIds = linkedSetOf<ContextId>()
+        mapItemContextIds += journal.assignments().filter {
+            it.executionId == result.executionId && it.mapItemId != null
+        }.map { it.contextId }
+        mapItemContextIds += journal.activationIntents().filter {
+            it.executionId == result.executionId && it.mapItemId != null
+        }.map { it.contextId }
         val contexts = contextIds.toList().sortedBy { it.value }.map { contextId ->
+            val kind = when {
+                contextId.value == InMemoryWorkflowRunner.ANONYMOUS_CONTEXT -> "anonymous"
+                contextId in mapItemContextIds -> "map-item"
+                else -> "correlated"
+            }
             val fields = linkedMapOf<String, JsonElement>(
                 "contextId" to JsonPrimitive(contextId.value),
-                "kind" to JsonPrimitive(
-                    if (contextId.value == InMemoryWorkflowRunner.ANONYMOUS_CONTEXT) "anonymous" else "correlated",
-                ),
+                "kind" to JsonPrimitive(kind),
             )
-            if (contextId.value != InMemoryWorkflowRunner.ANONYMOUS_CONTEXT) {
+            if (kind == "correlated") {
                 fields["correlationId"] = JsonPrimitive(contextId.value)
             }
             JsonObject(fields)
