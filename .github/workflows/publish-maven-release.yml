@@ -1,4 +1,4 @@
-name: Publish Maven release
+name: Publish Maven Central release
 
 on:
   push:
@@ -9,13 +9,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: nexus-release-${{ github.ref }}
+  group: maven-central-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
 
     steps:
       - name: Check out tagged revision
@@ -46,28 +46,31 @@ jobs:
           java-version: "21"
           cache: gradle
 
-      - name: Validate Nexus configuration
+      - name: Validate Maven Central configuration
         if: steps.main.outputs.publish == 'true'
         shell: bash
         env:
-          NEXUS_RELEASE_URL: ${{ secrets.NEXUS_RELEASE_URL }}
-          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
-          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          SIGNING_IN_MEMORY_KEY: ${{ secrets.SIGNING_IN_MEMORY_KEY }}
+          SIGNING_IN_MEMORY_KEY_PASSWORD: ${{ secrets.SIGNING_IN_MEMORY_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          test -n "$NEXUS_RELEASE_URL" || { echo "NEXUS_RELEASE_URL is not configured" >&2; exit 1; }
-          test -n "$NEXUS_USERNAME" || { echo "NEXUS_USERNAME is not configured" >&2; exit 1; }
-          test -n "$NEXUS_PASSWORD" || { echo "NEXUS_PASSWORD is not configured" >&2; exit 1; }
+          test -n "$MAVEN_CENTRAL_USERNAME" || { echo "MAVEN_CENTRAL_USERNAME is not configured" >&2; exit 1; }
+          test -n "$MAVEN_CENTRAL_PASSWORD" || { echo "MAVEN_CENTRAL_PASSWORD is not configured" >&2; exit 1; }
+          test -n "$SIGNING_IN_MEMORY_KEY" || { echo "SIGNING_IN_MEMORY_KEY is not configured" >&2; exit 1; }
+          test -n "$SIGNING_IN_MEMORY_KEY_PASSWORD" || { echo "SIGNING_IN_MEMORY_KEY_PASSWORD is not configured" >&2; exit 1; }
 
       - name: Test
         if: steps.main.outputs.publish == 'true'
         run: ./gradlew test --rerun-tasks --no-daemon
 
-      - name: Publish tagged version to Nexus
+      - name: Publish tagged version to Maven Central
         if: steps.main.outputs.publish == 'true'
         env:
           RELEASE_VERSION: ${{ github.ref_name }}
-          NEXUS_RELEASE_URL: ${{ secrets.NEXUS_RELEASE_URL }}
-          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
-          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
-        run: ./gradlew publish --no-daemon -PreleaseVersion="$RELEASE_VERSION"
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_IN_MEMORY_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_IN_MEMORY_KEY_PASSWORD }}
+        run: ./gradlew publishAndReleaseToMavenCentral --no-daemon -PreleaseVersion="$RELEASE_VERSION"

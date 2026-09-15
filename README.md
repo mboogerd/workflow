@@ -109,15 +109,19 @@ are in the [Workflow v1 implementation plan](implementation-plan/README.md).
     one mutation; assignment visibility and resulting activation intents are
     atomic.
 
-## Maven releases
+## Maven Central releases
 
-Pushing a tag whose commit is in `main` history runs the Maven release workflow.
-The published `io.workflow:workflow` version is exactly the tag name.
+The artifact is published as `dev.socaity.workflow:workflow`. Pushing a tag
+whose commit is in `main` history runs the Maven Central release workflow; the
+published version is exactly the tag name.
 
 Configure these GitHub Actions repository secrets before pushing a release tag:
 
-- `NEXUS_RELEASE_URL`: the full Nexus Maven releases repository URL;
-- `NEXUS_USERNAME`: a Nexus account allowed to publish releases;
-- `NEXUS_PASSWORD`: that account's password or user token.
+- `MAVEN_CENTRAL_USERNAME`: the username from a Central Portal user token;
+- `MAVEN_CENTRAL_PASSWORD`: the password from that user token;
+- `SIGNING_IN_MEMORY_KEY`: the ASCII-armored private GPG signing key;
+- `SIGNING_IN_MEMORY_KEY_PASSWORD`: the signing key passphrase.
 
-Tags that do not point into `main` history are ignored by the publishing steps.
+The Central Portal namespace `dev.socaity` must be verified before the first
+release. Tags that do not point into `main` history are ignored by the
+publishing steps.

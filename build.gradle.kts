@@ -2,10 +2,10 @@ plugins {
     kotlin("jvm") version "2.1.21"
     kotlin("plugin.serialization") version "2.1.21"
     application
-    `maven-publish`
+    id("com.vanniktech.maven.publish") version "0.35.0"
 }
 
-group = "io.workflow"
+group = "dev.socaity.workflow"
 version = providers.gradleProperty("releaseVersion").orElse("1.0.0").get()
 
 repositories { mavenCentral() }
@@ -20,33 +20,40 @@ dependencies {
 }
 
 kotlin { jvmToolchain(21) }
-java { withSourcesJar() }
 tasks.test { useJUnitPlatform() }
 application { mainClass.set("io.workflow.ApplicationKt") }
 
-publishing {
-    publications {
-        create<MavenPublication>("mavenJava") {
-            from(components["java"])
+mavenPublishing {
+    publishToMavenCentral(automaticRelease = true)
+    signAllPublications()
+    coordinates(group.toString(), "workflow", version.toString())
 
-            pom {
-                name.set("Workflow")
-                description.set("A backend-independent workflow language and Kotlin/JVM runtime.")
+    pom {
+        name.set("Workflow")
+        description.set("A backend-independent workflow language and Kotlin/JVM runtime.")
+        inceptionYear.set("2026")
+        url.set("https://github.com/mboogerd/workflow")
+
+        licenses {
+            license {
+                name.set("The Apache License, Version 2.0")
+                url.set("https://www.apache.org/licenses/LICENSE-2.0.txt")
+                distribution.set("https://www.apache.org/licenses/LICENSE-2.0.txt")
             }
         }
-    }
 
-    val nexusReleaseUrl = providers.environmentVariable("NEXUS_RELEASE_URL")
-    if (nexusReleaseUrl.isPresent) {
-        repositories {
-            maven {
-                name = "nexus"
-                url = uri(nexusReleaseUrl.get())
-                credentials {
-                    username = providers.environmentVariable("NEXUS_USERNAME").orNull
-                    password = providers.environmentVariable("NEXUS_PASSWORD").orNull
-                }
+        developers {
+            developer {
+                id.set("mboogerd")
+                name.set("Merlijn Boogerd")
+                url.set("https://github.com/mboogerd")
             }
+        }
+
+        scm {
+            url.set("https://github.com/mboogerd/workflow")
+            connection.set("scm:git:https://github.com/mboogerd/workflow.git")
+            developerConnection.set("scm:git:ssh://git@github.com/mboogerd/workflow.git")
         }
     }
 }
