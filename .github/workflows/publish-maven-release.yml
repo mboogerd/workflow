@@ -1,0 +1,73 @@
+name: Publish Maven release
+
+on:
+  push:
+    tags:
+      - "**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nexus-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out tagged revision
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check tag belongs to main
+        id: main
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_commit="$(git rev-parse "${GITHUB_REF}^{commit}")"
+
+          if git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag ${GITHUB_REF_NAME} does not point into main history; skipping publication."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Java 21
+        if: steps.main.outputs.publish == 'true'
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Validate Nexus configuration
+        if: steps.main.outputs.publish == 'true'
+        shell: bash
+        env:
+          NEXUS_RELEASE_URL: ${{ secrets.NEXUS_RELEASE_URL }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$NEXUS_RELEASE_URL" || { echo "NEXUS_RELEASE_URL is not configured" >&2; exit 1; }
+          test -n "$NEXUS_USERNAME" || { echo "NEXUS_USERNAME is not configured" >&2; exit 1; }
+          test -n "$NEXUS_PASSWORD" || { echo "NEXUS_PASSWORD is not configured" >&2; exit 1; }
+
+      - name: Test
+        if: steps.main.outputs.publish == 'true'
+        run: ./gradlew test --rerun-tasks --no-daemon
+
+      - name: Publish tagged version to Nexus
+        if: steps.main.outputs.publish == 'true'
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+          NEXUS_RELEASE_URL: ${{ secrets.NEXUS_RELEASE_URL }}
+          NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+          NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+        run: ./gradlew publish --no-daemon -PreleaseVersion="$RELEASE_VERSION"

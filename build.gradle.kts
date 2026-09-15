@@ -2,10 +2,11 @@ plugins {
     kotlin("jvm") version "2.1.21"
     kotlin("plugin.serialization") version "2.1.21"
     application
+    `maven-publish`
 }
 
 group = "io.workflow"
-version = "1.0.0"
+version = providers.gradleProperty("releaseVersion").orElse("1.0.0").get()
 
 repositories { mavenCentral() }
 
@@ -19,8 +20,36 @@ dependencies {
 }
 
 kotlin { jvmToolchain(21) }
+java { withSourcesJar() }
 tasks.test { useJUnitPlatform() }
 application { mainClass.set("io.workflow.ApplicationKt") }
+
+publishing {
+    publications {
+        create<MavenPublication>("mavenJava") {
+            from(components["java"])
+
+            pom {
+                name.set("Workflow")
+                description.set("A backend-independent workflow language and Kotlin/JVM runtime.")
+            }
+        }
+    }
+
+    val nexusReleaseUrl = providers.environmentVariable("NEXUS_RELEASE_URL")
+    if (nexusReleaseUrl.isPresent) {
+        repositories {
+            maven {
+                name = "nexus"
+                url = uri(nexusReleaseUrl.get())
+                credentials {
+                    username = providers.environmentVariable("NEXUS_USERNAME").orNull
+                    password = providers.environmentVariable("NEXUS_PASSWORD").orNull
+                }
+            }
+        }
+    }
+}
 
 tasks.register<JavaExec>("conformance") {
     group = "verification"

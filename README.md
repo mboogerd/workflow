@@ -108,3 +108,16 @@ are in the [Workflow v1 implementation plan](implementation-plan/README.md).
 10. Every v1 assignment is committed through a journal batch containing exactly
     one mutation; assignment visibility and resulting activation intents are
     atomic.
+
+## Maven releases
+
+Pushing a tag whose commit is in `main` history runs the Maven release workflow.
+The published `io.workflow:workflow` version is exactly the tag name.
+
+Configure these GitHub Actions repository secrets before pushing a release tag:
+
+- `NEXUS_RELEASE_URL`: the full Nexus Maven releases repository URL;
+- `NEXUS_USERNAME`: a Nexus account allowed to publish releases;
+- `NEXUS_PASSWORD`: that account's password or user token.
+
+Tags that do not point into `main` history are ignored by the publishing steps.
