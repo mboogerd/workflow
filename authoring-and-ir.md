@@ -49,6 +49,63 @@ Each `context` entry defines one named versioned register. Its definition is:
 - a mapping containing `match`; or
 - a mapping containing `map`.
 
+A producer mapping may contain an optional `schema` field for its assigned
+value. A provider mapping additionally contains optional deployment-static
+`config`, activation-bound `with`, and execution-policy fields defined by the
+provider descriptor and runtime policy schema.
+
+The exact v1 conditional shape is:
+
+```yaml
+context:
+  handled:
+    schema: string
+    match:
+      value: {$ref: "$.result"}
+      cases:
+        Succeeded:
+          $ref: "$.match.value.description"
+        Failed:
+          provider: report-failure
+          version: 1
+          with:
+            error: {$ref: "$.match.error"}
+```
+
+The discriminator schema is a tagged union. Each case value is one producer
+definition and every variant must have exactly one case. Inside a case,
+`$.match` denotes the entire captured discriminator value; ordinary context and
+parameter references remain available. Every case producer must have the same
+canonical output schema as the match register.
+
+The exact v1 finite-map shape is:
+
+```yaml
+context:
+  models:
+    map:
+      over: {$ref: "$.repositories"}
+      context:
+        snapshot:
+          provider: repository-read
+          version: 1
+          with:
+            repository: {$ref: "$.item"}
+        model:
+          provider: repository-model
+          version: 1
+          with:
+            snapshot: {$ref: "$.snapshot"}
+      output: model
+```
+
+`over` must produce a finite array or object. The body is a nested context graph
+and `output` names exactly one body register. The body additionally exposes
+`$.item` and `$.key`; array keys are zero-based integer indexes and object keys
+are strings in canonical key order. Body register names may not shadow an outer
+register or reserved lexical root. Body definitions may use the same four
+producer forms recursively, subject to finite acyclic validation.
+
 There are no `source`, `call`, or `let` wrappers. Entry order is not semantic.
 References in expressions, provider inputs, branches, and map bodies define
 dependencies.
@@ -103,6 +160,7 @@ The IR contains at least:
 - provider ids, versions, configurations, effects, and capabilities;
 - assignment, correlation, activation, and provenance semantics;
 - retry, timeout, cancellation, recovery, and map policies;
+- journal-batch, activation-intent, and causation semantics;
 - exported register names.
 
 The IR is language-neutral and versioned independently from the YAML surface
@@ -117,4 +175,3 @@ artifact independent of the host language.
 Complex glue uses a provider. Future tooling may package a local transform as a
 provider automatically, but the resulting IR must still expose a versioned
 provider boundary.
-

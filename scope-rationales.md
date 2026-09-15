@@ -81,3 +81,16 @@ small journal, register, correlation, and activation model directly.
 
 The IR remains backend-neutral so a ComputeNet backend can be reconsidered after
 the semantics have been exercised.
+
+## 2026-09-13 — SCOPE-007: Close v1 policy choices without adding policy syntax
+
+**Status:** Active
+
+An implementation plan cannot safely delegate choices such as stale-result
+handling, retention, provider discovery, or context completion to independent
+workers. V1 therefore fixes the simplest behavior: execute every activation,
+retain every record, register providers explicitly, and require administrative
+stop rather than semantic closure.
+
+These decisions do not add language surface. Later versions may add explicit
+alternative policies while preserving the v1 interpretation.

@@ -1,0 +1,143 @@
+plan:
+  id: workflow-v1
+  version: 1
+  repository: workflow
+  implementation:
+    model: gpt-5.6-luna
+  review:
+    model: gpt-5.6-sol
+    correction_allowed: true
+
+  milestones:
+    - id: M1
+      name: Compile and run
+      release: v0.1
+      stories:
+        - id: WFL-101
+          file: stories/M1/WFL-101-project-and-core-types.md
+          implementation_effort: medium
+          review_effort: medium
+          parallel_group: M1-A
+          depends_on: []
+        - id: WFL-102
+          file: stories/M1/WFL-102-yaml-compiler.md
+          implementation_effort: high
+          review_effort: high
+          parallel_group: M1-B
+          depends_on: [WFL-101]
+        - id: WFL-103
+          file: stories/M1/WFL-103-in-memory-runner.md
+          implementation_effort: xhigh
+          review_effort: high
+          parallel_group: M1-C
+          depends_on: [WFL-102]
+
+    - id: M2
+      name: One repository
+      release: v0.2
+      stories:
+        - id: WFL-201
+          file: stories/M2/WFL-201-provider-contracts.md
+          implementation_effort: high
+          review_effort: high
+          parallel_group: M2-A
+          depends_on: [WFL-103]
+        - id: WFL-202
+          file: stories/M2/WFL-202-provider-execution.md
+          implementation_effort: xhigh
+          review_effort: xhigh
+          parallel_group: M2-B
+          depends_on: [WFL-201]
+        - id: WFL-203
+          file: stories/M2/WFL-203-single-repository-slice.md
+          implementation_effort: medium
+          review_effort: medium
+          parallel_group: M2-C
+          depends_on: [WFL-202]
+
+    - id: M3
+      name: System snapshot
+      release: v0.3
+      stories:
+        - id: WFL-301
+          file: stories/M3/WFL-301-branch-and-map-ir.md
+          implementation_effort: xhigh
+          review_effort: high
+          parallel_group: M3-A
+          depends_on: [WFL-203]
+        - id: WFL-302
+          file: stories/M3/WFL-302-match-runtime.md
+          implementation_effort: high
+          review_effort: high
+          parallel_group: M3-B
+          depends_on: [WFL-301]
+        - id: WFL-303
+          file: stories/M3/WFL-303-map-gather-runtime.md
+          implementation_effort: xhigh
+          review_effort: xhigh
+          parallel_group: M3-B
+          depends_on: [WFL-301]
+        - id: WFL-304
+          file: stories/M3/WFL-304-multi-repository-slice.md
+          implementation_effort: high
+          review_effort: high
+          parallel_group: M3-C
+          depends_on: [WFL-302, WFL-303]
+
+    - id: M4
+      name: Continuous and durable
+      release: v0.4
+      stories:
+        - id: WFL-401
+          file: stories/M4/WFL-401-streams-and-correlation.md
+          implementation_effort: xhigh
+          review_effort: xhigh
+          parallel_group: M4-A
+          depends_on: [WFL-304]
+        - id: WFL-402
+          file: stories/M4/WFL-402-sqlite-journal.md
+          implementation_effort: xhigh
+          review_effort: xhigh
+          parallel_group: M4-A
+          depends_on: [WFL-304]
+        - id: WFL-403
+          file: stories/M4/WFL-403-restart-and-replay.md
+          implementation_effort: xhigh
+          review_effort: xhigh
+          parallel_group: M4-B
+          depends_on: [WFL-402]
+        - id: WFL-404
+          file: stories/M4/WFL-404-continuous-repository-slice.md
+          implementation_effort: high
+          review_effort: high
+          parallel_group: M4-C
+          depends_on: [WFL-401, WFL-403]
+
+    - id: M5
+      name: Safe agentic v1
+      release: v1.0
+      stories:
+        - id: WFL-501
+          file: stories/M5/WFL-501-retry-timeout-cancellation.md
+          implementation_effort: high
+          review_effort: high
+          parallel_group: M5-A
+          depends_on: [WFL-404]
+        - id: WFL-502
+          file: stories/M5/WFL-502-effects-and-reconciliation.md
+          implementation_effort: xhigh
+          review_effort: xhigh
+          parallel_group: M5-B
+          depends_on: [WFL-501]
+        - id: WFL-503
+          file: stories/M5/WFL-503-agentic-providers-and-recovery.md
+          implementation_effort: xhigh
+          review_effort: xhigh
+          parallel_group: M5-B
+          depends_on: [WFL-501]
+        - id: WFL-504
+          file: stories/M5/WFL-504-v1-conformance-release.md
+          implementation_effort: high
+          review_effort: xhigh
+          parallel_group: M5-C
+          depends_on: [WFL-502, WFL-503]

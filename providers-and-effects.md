@@ -39,6 +39,11 @@ Each emission contains:
 - stable provider emission identity;
 - invocation and attempt provenance.
 
+Lifecycle messages from one invocation form an ordered protocol stream. The
+runtime observes that stream in provider order. Messages from different
+invocations have no provider-level relative order; their accepted assignments
+are ordered by the workflow execution journal.
+
 The engine routes the emission and appends it to the register named by the
 provider definition.
 
@@ -93,4 +98,3 @@ Provider implementations may use any language. Calls cross the runtime boundary
 through the canonical value and provider protocols. Small portable
 transformations remain expressions; complex or language-specific transformations
 are providers even when deployed in-process.
-

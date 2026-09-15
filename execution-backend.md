@@ -24,23 +24,35 @@ The first backend contains:
 - timeout, cancellation, retry, reconciliation, and recovery handling;
 - replay, inspection, and provenance queries.
 
+Activation intent is durable state, not an in-memory consequence reconstructed
+after an assignment is committed. The runtime must not expose an assignment and
+then risk losing its downstream work in a crash gap.
+
 It may initially run as one process with one durable database. Distribution,
 replication, and horizontal scheduling are not first-milestone requirements.
 
 ## Processing boundary
 
-The backend processes provider emissions through one logical commit path:
+The backend processes provider emissions through one logical journal-batch
+commit path:
 
 1. validate emission identity and schema;
 2. resolve its target context from optional correlation;
-3. append the assignment and provenance to the journal;
-4. update the materialized current-value view;
-5. discover affected dependents;
-6. append or schedule their activations with captured input revisions.
+3. construct a batch containing exactly one assignment mutation in v1;
+4. derive the next register revision and affected activation intents;
+5. atomically append the batch, assignment provenance, current-view update, and
+   activation intents;
+6. make committed activation intents available to workers.
 
 The journal order is authoritative for replay and current-value selection. The
 physical implementation may batch work but must preserve the same observable
 records.
+
+Storage schemas, journal records, provider protocol messages, and canonical IR
+all carry explicit format versions. Runtime services are separated behind
+interfaces for compilation, journal commit, current-view projection, activation
+planning, provider invocation, and output publication. The first implementation
+may colocate them in one process and database.
 
 ## Provider isolation
 

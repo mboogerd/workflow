@@ -60,16 +60,26 @@ The initial version includes:
 - Generated typed authoring frontends.
 - A ComputeNet execution backend.
 
-## Current open decisions
+## Initial-version closure decisions
 
-1. The exact schema system and compatibility rules at provider boundaries.
-2. Scheduling semantics when a dependency changes while its consumer is still
-   running, including stale result handling.
-3. Whether provider emissions are globally ordered per context or only ordered
-   per named register.
-4. The provider packaging, discovery, and deployment protocol.
-5. How effectful downstream providers expose and control repeated activation.
-6. The exact reactive semantics of `match` and `map` under repeated updates.
-7. Which execution records are retained indefinitely versus compacted.
-8. When a workflow execution or keyed context may be closed and collected.
+- Schemas use the closed portable algebra in [Schemas](schemas.md).
+- Every dependency-revision vector creates a distinct activation. A newer
+  activation does not cancel, coalesce, or invalidate an older one in v1.
+- Accepted assignments have one authoritative total journal order per workflow
+  execution. Provider-local production order is preserved only where the
+  provider protocol declares it.
+- Providers are registered explicitly with the runtime. Dynamic package
+  discovery and remote deployment are outside v1, although invocation remains
+  behind a language-neutral protocol boundary.
+- Effectful providers run once for every activation and must satisfy the
+  idempotency or reconciliation contract. V1 supplies no repeated-activation
+  suppression policy.
+- `match` and `map` create independent work for every triggering input revision,
+  as defined in [Execution semantics](execution-semantics.md).
+- V1 performs no journal compaction. All semantic and operational records are
+  retained.
+- Contexts and executions have no semantic close operation. A host may stop an
+  execution administratively, but that does not synthesize completion facts.
 
+Questions about alternative policies remain valid extension work, but do not
+leave v1 runtime behavior unspecified.

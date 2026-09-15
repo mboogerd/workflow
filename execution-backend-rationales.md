@@ -74,3 +74,16 @@ the observable semantics have stabilized.
 The earlier external-effect conclusion remains active: neither a standalone
 journal nor ComputeNet can make an external mutation exactly once without
 idempotency or reconciliation at the provider boundary.
+
+## 2026-09-13 — BACKEND-008: Persist singleton batches and activation intent
+
+**Status:** Active
+
+A bare assignment transaction creates two future and present problems: atomic
+multi-value changes would later need a new outer identity, and a crash between
+assignment commit and downstream scheduling can lose work. V1 therefore writes
+one assignment through a versioned singleton batch and persists the derived
+activation intents in the same storage transaction.
+
+Relaxing batch cardinality is future work. The v1 runtime must reject attempts
+to use the storage seam as an undocumented multi-assignment feature.

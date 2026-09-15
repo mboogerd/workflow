@@ -81,6 +81,8 @@ are lexical:
 - ordinary definitions expose current context registers as `$.<name>` and
   workflow parameters as `$.parameters`;
 - a `map` body additionally exposes `$.item` and `$.key`;
+- a `match` case additionally exposes `$.match`, the entire captured
+  discriminator value;
 - provider implementations receive their bound input through the provider
   protocol rather than gaining implicit access to the whole context.
 
@@ -125,6 +127,6 @@ context:
             body: {$ref: "$.pr.error.report"}
 ```
 
-The exact branch-local reference shape remains subject to the provider output
-schema.
-
+The branch may use `$.match` as specified in
+[Authoring and IR](authoring-and-ir.md) or refer to the discriminator's ordinary
+context register directly.

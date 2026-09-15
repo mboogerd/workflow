@@ -61,3 +61,12 @@ assigned.
 
 The runtime still observes emission, completion, and failure messages, but the
 workflow language does not require a source/call category or declared cardinality.
+
+## 2026-09-13 — PROVIDER-006: Order lifecycle messages per invocation
+
+**Status:** Active
+
+Emission, failure, and completion ordering from one invocation must be
+unambiguous for protocol validation. The provider stream supplies that order.
+Different invocations remain concurrent, so only accepted journal order defines
+their relative visibility.

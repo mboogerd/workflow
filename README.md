@@ -1,10 +1,11 @@
 # Workflow language design
 
-This directory describes a small, backend-independent workflow language. The
-present direction is YAML with a deliberately limited expression vocabulary
-that lowers almost directly to a portable workflow IR.
+This directory specifies the first version of a small, backend-independent
+workflow language. YAML uses a deliberately limited expression vocabulary that
+lowers almost directly to a portable workflow IR.
 
-This is a design, not yet an implementation contract.
+The topic files are the implementation contract for v1. Deferred extensions
+are intentionally absent rather than partially specified.
 
 ## Document contract
 
@@ -68,6 +69,7 @@ future backend.
 | [Scope](scope.md) | [Rationales](scope-rationales.md) | Initial boundary, non-goals, unresolved decisions |
 | [Core model](core-model.md) | [Rationales](core-model-rationales.md) | Versioned registers, producers, and dependencies |
 | [Values and bindings](values-and-bindings.md) | [Rationales](values-and-bindings-rationales.md) | Data model and deliberately small expression language |
+| [Schemas](schemas.md) | [Rationales](schemas-rationales.md) | Portable v1 schema algebra and compatibility |
 | [Execution semantics](execution-semantics.md) | [Rationales](execution-semantics-rationales.md) | Assignments, activation, reactivity, and replay |
 | [Providers and effects](providers-and-effects.md) | [Rationales](providers-and-effects-rationales.md) | Provider emissions and side-effect safety |
 | [Agentic steps](agentic-steps.md) | [Rationales](agentic-steps-rationales.md) | Bounded nondeterminism and agent-framework integration |
@@ -75,6 +77,7 @@ future backend.
 | [Instances and events](instances-and-events.md) | [Rationales](instances-and-events-rationales.md) | Anonymous startup, correlation routing, keyed contexts |
 | [Authoring and IR](authoring-and-ir.md) | [Rationales](authoring-and-ir-rationales.md) | YAML syntax, compiler, validation, portable artifact |
 | [Execution backend](execution-backend.md) | [Rationales](execution-backend-rationales.md) | Purpose-built first runtime and backend boundary |
+| [Evolution seams](evolution-seams.md) | [Rationales](evolution-seams-rationales.md) | Low-cost v1 constraints that preserve an incremental future |
 
 ## Suggested reading paths
 
@@ -82,6 +85,9 @@ future backend.
 - Integrations: providers and effects → failure and recovery.
 - Agentic workflows: agentic steps → failure and recovery → execution semantics.
 - Implementation: authoring and IR → execution backend → instances and events.
+
+The vertically sliced implementation sequence and Luna/Sol agent configuration
+are in the [Workflow v1 implementation plan](implementation-plan/README.md).
 
 ## Cross-cutting invariants
 
@@ -99,3 +105,6 @@ future backend.
    authorized.
 9. The canonical IR, not YAML presentation details or a particular backend, is
    the durable workflow definition.
+10. Every v1 assignment is committed through a journal batch containing exactly
+    one mutation; assignment visibility and resulting activation intents are
+    atomic.

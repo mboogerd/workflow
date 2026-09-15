@@ -74,3 +74,26 @@ second emission because its key or payload repeats would introduce hidden
 cardinality or deduplication policy. The first milestone therefore records and
 propagates every accepted assignment. Explicit once, distinct, debounce, and
 coalescing policies can be added only when concrete use cases require them.
+
+## 2026-09-13 — EXEC-008: Execute every captured activation in v1
+
+**Status:** Active
+
+Latest-only, cancellation, and stale-result rejection are important for a future
+incremental repository-model workflow, but each requires explicit policy and
+effect semantics. V1 executes every distinct dependency-revision vector and
+accepts every valid result, retaining provenance when completion order differs
+from input order.
+
+## 2026-09-13 — EXEC-009: Make match and map outputs reactive
+
+**Status:** Active
+
+A selected match branch and a map item may contain a provider that emits more
+than once. Silently taking only its first or last value would contradict the
+register model. Match therefore forwards every selected-case output. A map emits
+once all item outputs are present and re-emits its gathered latest view whenever
+an item output changes.
+
+The map activation remains tied to one captured finite input revision; this is
+reactivity within a finite family, not a streaming collection.

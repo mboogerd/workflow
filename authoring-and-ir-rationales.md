@@ -84,3 +84,13 @@ clearly a derivation, so `let` adds no information.
 The smaller surface makes YAML track the IR more directly: each register has an
 expression, provider, match, or map producer, and references provide all graph
 dependencies.
+
+## 2026-09-13 — AUTHOR-008: Fix the first match and map YAML shapes
+
+**Status:** Active
+
+Leaving branch-local bindings and nested map structure illustrative would force
+the compiler implementation to invent durable syntax. V1 uses one captured
+`$.match` value for cases and an explicit `over`/nested `context`/named `output`
+map form. Both lower directly to the existing producer graph and keep collection
+cardinality visible.
