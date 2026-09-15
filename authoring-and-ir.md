@@ -157,7 +157,8 @@ The IR contains at least:
 - producer kinds, dependencies, and nested graph structure;
 - expression and predicate ASTs;
 - input, emission, and error schemas;
-- provider ids, versions, configurations, effects, and capabilities;
+- provider ids, versions, configurations, effects, capabilities, and bound
+  effect idempotency keys;
 - assignment, correlation, activation, and provenance semantics;
 - retry, timeout, cancellation, recovery, and map policies;
 - journal-batch, activation-intent, and causation semantics;

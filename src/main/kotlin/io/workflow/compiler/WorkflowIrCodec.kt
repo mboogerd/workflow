@@ -84,6 +84,7 @@ object WorkflowIrCodec {
         input = expression(value.required("input")),
         capabilities = value.requiredArray("capabilities").map { it.asPrimitive("capability").content }.toSet(),
         policy = io.workflow.core.CanonicalValueJson.decode(value.required("policy").toString()),
+        idempotencyKey = value["idempotency-key"]?.let { expression(it) },
     )
 
     private fun match(value: JsonObject): CompiledMatch = CompiledMatch(

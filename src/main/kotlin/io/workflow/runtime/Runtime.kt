@@ -2422,10 +2422,17 @@ class InMemoryWorkflowRunner(
         val config = materialize(evaluate(binding.config, workflow, parameters, context, scope))
         validateProviderBinding(descriptor.inputSchema.validate(input), "provider input")
         validateProviderBinding(descriptor.configurationSchema.validate(config), "provider configuration")
+        val idempotencyKey = binding.idempotencyKey?.let { expression ->
+            when (val evaluated = materialize(evaluate(expression, workflow, parameters, context, scope))) {
+                is Value.StringValue -> evaluated.value
+                else -> throw BindingFailure("idempotency-key must evaluate to a string value")
+            }
+        } ?: invocationId.value
 
         val invocationEventId = invocationCausation ?: recordedInvocation?.eventId ?: recordProviderEvent(
             workflow, intent, invocationId, null, ProviderEventType.INVOCATION,
             causationId = intent.id.value, register = register,
+            value = Value.StringValue(idempotencyKey),
         ).eventId
 
         val implementation = registration.implementation
@@ -2456,7 +2463,7 @@ class InMemoryWorkflowRunner(
             attemptId = attemptId,
             input = input,
             config = config,
-            idempotencyKey = invocationId.value,
+            idempotencyKey = idempotencyKey,
             parentActivationId = intent.parentActivationId,
             discriminatorRevision = intent.discriminatorRevision,
         )

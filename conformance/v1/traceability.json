@@ -51,7 +51,7 @@
     "providers-and-effects.md#uniform-provider-contract": {"scenarios": ["providers"]},
     "providers-and-effects.md#activation-and-emission": {"scenarios": ["providers", "retry"]},
     "providers-and-effects.md#effect-classes": {"scenarios": ["effects", "agentic"]},
-    "providers-and-effects.md#invocation-identity": {"scenarios": ["retry", "effects"]},
+    "providers-and-effects.md#invocation-identity": {"scenarios": ["retry", "effects", "idempotency-key"]},
     "providers-and-effects.md#failure-and-emitted-error-values": {"scenarios": ["failure"]},
     "providers-and-effects.md#reconciliation": {"scenarios": ["effects", "continuous"]},
     "providers-and-effects.md#portability": {"scenarios": ["providers", "replay"]},
@@ -74,7 +74,7 @@
     "instances-and-events.md#repeated-correlation": {"scenarios": ["repeated-assignments"]},
     "instances-and-events.md#lifecycle": {"scenarios": ["continuous", "restart"]},
 
-    "authoring-and-ir.md#initial-authoring-surface": {"scenarios": ["expressions", "match", "map-gather"]},
+    "authoring-and-ir.md#initial-authoring-surface": {"scenarios": ["expressions", "match", "map-gather", "idempotency-key"]},
     "authoring-and-ir.md#compilation-pipeline": {"scenarios": ["startup", "schemas"]},
     "authoring-and-ir.md#static-validation": {"scenarios": ["schemas"], "explanation": "Invalid graphs are represented as expected compile diagnostics."},
     "authoring-and-ir.md#portable-ir": {"scenarios": ["replay", "restart"]},

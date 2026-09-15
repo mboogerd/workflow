@@ -212,7 +212,7 @@ class EffectReconciliationTest {
           id: reconciliation
           version: 1
           context:
-            value: {provider: effect, version: 1, policy: {maximum-attempts: 2, retryable-error-classes: [transient]}}
+            value: {provider: effect, version: 1, idempotency-key: reconciliation-value, policy: {maximum-attempts: 2, retryable-error-classes: [transient]}}
           outputs: [value]
     """.trimIndent()
 

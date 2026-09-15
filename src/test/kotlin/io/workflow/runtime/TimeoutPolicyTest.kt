@@ -164,7 +164,7 @@ class TimeoutPolicyTest {
           id: timeout-policy
           version: 1
           context:
-            value: {provider: timed-provider, version: 1, policy: $policy}
+            value: {provider: timed-provider, version: 1, idempotency-key: timed-value, policy: $policy}
           outputs: [value]
     """.trimIndent()
 

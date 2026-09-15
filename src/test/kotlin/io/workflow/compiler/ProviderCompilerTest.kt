@@ -3,12 +3,14 @@ package io.workflow.compiler
 import io.workflow.core.Value
 import io.workflow.core.ValueSchema
 import io.workflow.provider.EffectClass
+import io.workflow.provider.IdempotencyContract
 import io.workflow.provider.ProviderDescriptor
 import io.workflow.provider.ProviderInvocationRequest
 import io.workflow.provider.ProviderLifecycle
 import io.workflow.provider.ProviderLifecycleMessage
 import io.workflow.provider.ProviderRegistry
 import io.workflow.provider.ProviderCompatibility
+import io.workflow.provider.ReconciliationMode
 import io.workflow.core.AttemptId
 import io.workflow.core.EmissionId
 import io.workflow.core.InvocationId
@@ -36,6 +38,176 @@ class ProviderCompilerTest {
                 lifecycle = ProviderLifecycle(supportsOpenActivation = true),
             ),
         )
+    }
+
+    /** A registry with both a pure `greeter` and an effect `notifier` provider, the
+     * latter satisfying the pre-existing descriptor-level idempotency requirement
+     * so that only the new `idempotency-key` binding is under test. */
+    private fun effectRegistry(): ProviderRegistry = registry().also {
+        it.register(
+            ProviderDescriptor(
+                providerId = "notifier",
+                version = 1,
+                inputSchema = ValueSchema.String,
+                emissionSchema = ValueSchema.String,
+                effectClass = EffectClass.EFFECT,
+                idempotency = IdempotencyContract(ReconciliationMode.IDEMPOTENT_BY_INVOCATION),
+            ),
+        )
+    }
+
+    @Test
+    fun `effect provider accepts a string idempotency-key bound to a reference`() {
+        val result = WorkflowCompiler(providerRegistry = effectRegistry()).compile(
+            """
+            workflow:
+              id: idempotency-key-accepted
+              version: 1
+              parameters:
+                tag: {schema: string}
+              context:
+                sent:
+                  provider: notifier
+                  version: 1
+                  with: {${'$'}ref: '${'$'}.parameters.tag'}
+                  idempotency-key: {${'$'}concat: ['tag-', {${'$'}ref: '${'$'}.parameters.tag'}]}
+              outputs: [sent]
+            """.trimIndent(),
+        )
+        assertTrue(result.isValid, result.diagnostics.joinToString())
+        val register = result.ir!!.registers.single { it.name == "sent" }
+        assertNotNull(register.provider!!.idempotencyKey)
+        assertTrue(register.canonicalProviderJson().contains("idempotency-key"))
+    }
+
+    @Test
+    fun `effect provider without idempotency-key is a compile diagnostic`() {
+        val result = WorkflowCompiler(providerRegistry = effectRegistry()).compile(
+            """
+            workflow:
+              id: idempotency-key-missing
+              version: 1
+              context:
+                sent: {provider: notifier, version: 1, with: hello}
+              outputs: [sent]
+            """.trimIndent(),
+        )
+        assertFalse(result.isValid)
+        assertTrue(result.diagnostics.any { it.message.contains("must declare idempotency-key") })
+    }
+
+    @Test
+    fun `non-string idempotency-key is a compile diagnostic for a literal and a referenced value`() {
+        val literal = WorkflowCompiler(providerRegistry = effectRegistry()).compile(
+            """
+            workflow:
+              id: idempotency-key-literal-wrong-type
+              version: 1
+              context:
+                sent: {provider: notifier, version: 1, with: hello, idempotency-key: 7}
+              outputs: [sent]
+            """.trimIndent(),
+        )
+        assertFalse(literal.isValid)
+        assertTrue(literal.diagnostics.any { it.message.contains("idempotency-key") && it.message.contains("incompatible") })
+
+        val referenced = WorkflowCompiler(providerRegistry = effectRegistry()).compile(
+            """
+            workflow:
+              id: idempotency-key-referenced-wrong-type
+              version: 1
+              parameters:
+                tag: {schema: integer}
+              context:
+                sent:
+                  provider: notifier
+                  version: 1
+                  with: hello
+                  idempotency-key: {${'$'}ref: '${'$'}.parameters.tag'}
+              outputs: [sent]
+            """.trimIndent(),
+        )
+        assertFalse(referenced.isValid)
+        assertTrue(referenced.diagnostics.any { it.message.contains("idempotency-key") && it.message.contains("incompatible") })
+    }
+
+    @Test
+    fun `idempotency-key is optional for pure read and agentic providers`() {
+        val result = WorkflowCompiler(providerRegistry = registry()).compile(
+            """
+            workflow:
+              id: idempotency-key-optional
+              version: 1
+              context:
+                name: Ada
+                greeting:
+                  provider: greeter
+                  version: 1
+                  config: {region: eu}
+                  with: {name: {${'$'}ref: '${'$'}.name'}}
+              outputs: [greeting]
+            """.trimIndent(),
+        )
+        assertTrue(result.isValid, result.diagnostics.joinToString())
+        assertEquals(null, result.ir!!.registers.single { it.name == "greeting" }.provider!!.idempotencyKey)
+    }
+
+    @Test
+    fun `idempotency-key binds inside a match branch and contributes its dependency`() {
+        val decisionSchema = ValueSchema.TaggedUnion(
+            discriminator = "kind",
+            variants = mapOf(
+                "ok" to ValueSchema.Object(mapOf("kind" to ValueSchema.Object.Field(ValueSchema.String))),
+            ),
+        )
+        val registry = effectRegistry().also {
+            it.register(ProviderDescriptor("decisions", 1, ValueSchema.Any, decisionSchema))
+        }
+        val result = WorkflowCompiler(providerRegistry = registry).compile(
+            """
+            workflow:
+              id: idempotency-key-match-branch
+              version: 1
+              parameters:
+                tag: {schema: string}
+              context:
+                decisions: {provider: decisions, version: 1}
+                selected:
+                  schema: string
+                  match:
+                    value: {${'$'}ref: '${'$'}.decisions'}
+                    cases:
+                      ok:
+                        provider: notifier
+                        version: 1
+                        with: hello
+                        idempotency-key: {${'$'}ref: '${'$'}.parameters.tag'}
+              outputs: [selected]
+            """.trimIndent(),
+        )
+        assertTrue(result.isValid, result.diagnostics.joinToString())
+        val match = result.ir!!.registers.single { it.name == "selected" }.match!!
+        val branch = match.cases.getValue("ok") as CompiledProducer.Provider
+        assertNotNull(branch.value.idempotencyKey)
+
+        val missing = WorkflowCompiler(providerRegistry = registry).compile(
+            """
+            workflow:
+              id: idempotency-key-match-branch-missing
+              version: 1
+              context:
+                decisions: {provider: decisions, version: 1}
+                selected:
+                  schema: string
+                  match:
+                    value: {${'$'}ref: '${'$'}.decisions'}
+                    cases:
+                      ok: {provider: notifier, version: 1, with: hello}
+              outputs: [selected]
+            """.trimIndent(),
+        )
+        assertFalse(missing.isValid)
+        assertTrue(missing.diagnostics.any { it.message.contains("must declare idempotency-key") })
     }
 
     @Test

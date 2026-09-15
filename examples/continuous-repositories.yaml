@@ -40,6 +40,9 @@ workflow:
       provider: demo.architecture-publication
       version: 1
       with: {$ref: "$.architecture"}
+      # Reconcile on the architecture summary rather than the logical invocation
+      # id, so a re-cut of the same repository set converges on one publication.
+      idempotency-key: {$ref: "$.architecture.summary"}
       policy:
         maximum-attempts: 2
         retryable-error-classes: [transient]
