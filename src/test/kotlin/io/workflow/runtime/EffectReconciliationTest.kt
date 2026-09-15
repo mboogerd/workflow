@@ -52,6 +52,14 @@ class EffectReconciliationTest {
         assertEquals(1, provider.writes)
         assertEquals(2, provider.keys.size)
         assertEquals(1, provider.keys.distinct().size)
+        // Reconciliation must query the identity the external write actually used, which is
+        // the author-bound idempotency-key rather than the logical invocation id.
+        assertEquals(listOf("reconciliation-value"), provider.reconcileKeys)
+        assertEquals(listOf("reconciliation-value"), provider.keys.distinct())
+        assertTrue(result.journal.providerEvents().any {
+            it.type == ProviderEventType.RECONCILIATION_REQUESTED &&
+                it.diagnostic!!.contains("idempotencyKey=reconciliation-value")
+        })
         assertEquals("retried", (result.outputs.getValue("value").value as Value.StringValue).value)
     }
 
@@ -212,7 +220,7 @@ class EffectReconciliationTest {
           id: reconciliation
           version: 1
           context:
-            value: {provider: effect, version: 1, policy: {maximum-attempts: 2, retryable-error-classes: [transient]}}
+            value: {provider: effect, version: 1, idempotency-key: reconciliation-value, policy: {maximum-attempts: 2, retryable-error-classes: [transient]}}
           outputs: [value]
     """.trimIndent()
 
@@ -221,6 +229,7 @@ class EffectReconciliationTest {
         var reconcileCalls = 0
         val reconciliationAttemptIds = mutableListOf<io.workflow.core.AttemptId?>()
         val keys = mutableListOf<String>()
+        val reconcileKeys = mutableListOf<String>()
         private var calls = 0
         override fun invoke(request: ProviderInvocationRequest): Iterable<ProviderLifecycleMessage> {
             keys += request.idempotencyKey
@@ -235,6 +244,7 @@ class EffectReconciliationTest {
         override fun reconcile(request: ReconciliationRequest): ReconciliationResult {
             reconcileCalls += 1
             reconciliationAttemptIds += request.reconciliationAttemptId
+            reconcileKeys += request.idempotencyKey
             return if (applied) {
             ReconciliationResult(disposition = ReconciliationDisposition.DEFINITELY_APPLIED, recordedResult = Value.StringValue("recorded"))
             } else ReconciliationResult(disposition = ReconciliationDisposition.DEFINITELY_NOT_APPLIED)

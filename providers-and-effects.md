@@ -71,6 +71,20 @@ An effect provider uses the logical invocation id as an idempotency key when the
 external system supports one. Repeated assignments intentionally create distinct
 activations and therefore distinct effect identities.
 
+An effect provider producer may bind `idempotency-key` to an expression using
+the same reference machinery as `with` and `config`. Compilation requires it to
+be string-valued and requires effect providers to declare it; it is optional for
+pure, read, and agentic providers. When declared, the bound value is evaluated
+alongside `input` and `config` from the same dependency-revision snapshot and is
+used as the invocation's idempotency key instead of the logical invocation id.
+This is the only way to make two distinct activations — from separate runs, or
+from separate correlated contexts — converge on one external reconciliation
+identity; the key is recorded on the invocation event for replay, inspection,
+and audit. Invocation identity itself is unaffected: two activations with the
+same bound idempotency key still have distinct invocation ids. Reconciliation of
+an ambiguous attempt uses that same recorded key, so a reconciling provider is
+always asked about the identity the external write actually used.
+
 ## Failure and emitted error values
 
 Provider lifecycle failure is recorded against the activation and does not erase

@@ -190,7 +190,7 @@ class RestartReplayTest {
           id: provider-restart
           version: 1
           context:
-            value: {provider: restart-provider, version: 1}
+            value: {provider: restart-provider, version: 1, idempotency-key: restart-value}
           outputs: [value]
     """.trimIndent()
 

@@ -95,6 +95,8 @@ data class CompiledProvider(
     val input: Expression,
     val capabilities: Set<String> = emptySet(),
     val policy: Value = Value.ObjectValue(emptyMap()),
+    /** Bound reconciliation identity; absent unless the author declares `idempotency-key`. */
+    val idempotencyKey: Expression? = null,
 ) {
     val providerVersion: Int get() = version
 }
@@ -473,7 +475,8 @@ class WorkflowCompiler(
 
         fun draftDependencies(draft: ProducerDraft): Set<String> = when (draft) {
             is ProducerDraft.Expression -> dependencies(draft.value).toSet()
-            is ProducerDraft.Provider -> dependencies(draft.value.input).toSet() + dependencies(draft.value.config)
+            is ProducerDraft.Provider -> dependencies(draft.value.input).toSet() + dependencies(draft.value.config) +
+                (draft.value.idempotencyKey?.let(::dependencies) ?: emptyList())
             is ProducerDraft.Match -> draftDependenciesFromExpression(draft.value) + draft.cases.values.flatMap { draftDependencies(it) }
             is ProducerDraft.Map -> draftDependenciesFromExpression(draft.value) + draft.context.values.flatMap { draftDependencies(it) }
         }
@@ -580,10 +583,18 @@ class WorkflowCompiler(
                         "bound input schema ${schemaName(inputSchema)} is incompatible with provider input ${schemaName(descriptor.inputSchema)}",
                         "${draft.path}.with", source,
                     )
+                    draft.value.idempotencyKey?.let { idempotencyKey ->
+                        val idempotencyKeySchema = expressionSchema(idempotencyKey, "${draft.path}.idempotency-key")
+                        if (!idempotencyKeySchema.isCompatibleWith(ValueSchema.String)) diagnostics += Diagnostic(
+                            "idempotency-key schema ${schemaName(idempotencyKeySchema)} is incompatible with required string",
+                            "${draft.path}.idempotency-key", source,
+                        )
+                    }
                 }
                 val schema = descriptor?.emissionSchema ?: ValueSchema.Any
                 compatible(schema, draft.explicitSchema, "${draft.path}.schema")
-                val node = CompiledProducer.Provider(draft.value, producerId, schema, (deps(draft.value.input) + deps(draft.value.config)).distinct().sorted(), source)
+                val idempotencyKeyDeps = draft.value.idempotencyKey?.let(::deps) ?: emptyList()
+                val node = CompiledProducer.Provider(draft.value, producerId, schema, (deps(draft.value.input) + deps(draft.value.config) + idempotencyKeyDeps).distinct().sorted(), source)
                 DraftCompilation(node, draft.value.input, draft.value, null, null)
             }
             is ProducerDraft.Match -> {
@@ -745,7 +756,7 @@ class WorkflowCompiler(
             diagnostics += Diagnostic("provider producer must be a mapping", path, node.location.source())
             return null
         }
-        checkFields(map, setOf("provider", "version", "config", "with", "schema", "policy", "capabilities"), path, diagnostics)
+        checkFields(map, setOf("provider", "version", "config", "with", "schema", "policy", "capabilities", "idempotency-key"), path, diagnostics)
         val providerId = (map.get("provider") as? YamlScalar)?.content?.takeIf { it.isNotBlank() }
         if (providerId == null) {
             diagnostics += Diagnostic("provider producer form is not supported: provider must be a non-empty string", "$path.provider", location(map, "provider"))
@@ -780,6 +791,28 @@ class WorkflowCompiler(
             val inputSchema = inferExpression(input, emptyMap(), emptyMap(), emptySet(), emptySet(), diagnostics, "$path.with", withNode?.location?.source() ?: node.location.source())
             if (!inputSchema.isCompatibleWith(descriptor.inputSchema)) {
                 diagnostics += Diagnostic("bound input schema ${schemaName(inputSchema)} is incompatible with provider input ${schemaName(descriptor.inputSchema)}", "$path.with", withNode?.location?.source() ?: node.location.source())
+            }
+        }
+
+        val idempotencyKeyNode = map.get<YamlNode>("idempotency-key")
+        val idempotencyKey = idempotencyKeyNode?.let { parseExpression(it, "$path.idempotency-key", diagnostics) }
+        if (idempotencyKeyNode == null) {
+            if (descriptor.effectClass == EffectClass.EFFECT) {
+                diagnostics += Diagnostic(
+                    "effect provider must declare idempotency-key",
+                    "$path.idempotency-key", node.location.source(),
+                )
+            }
+        } else if (idempotencyKey != null && !containsReference(idempotencyKey)) {
+            val idempotencyKeySchema = inferExpression(
+                idempotencyKey, emptyMap(), emptyMap(), emptySet(), emptySet(), diagnostics,
+                "$path.idempotency-key", idempotencyKeyNode.location.source(),
+            )
+            if (!idempotencyKeySchema.isCompatibleWith(ValueSchema.String)) {
+                diagnostics += Diagnostic(
+                    "idempotency-key schema ${schemaName(idempotencyKeySchema)} is incompatible with required string",
+                    "$path.idempotency-key", idempotencyKeyNode.location.source(),
+                )
             }
         }
 
@@ -842,7 +875,7 @@ class WorkflowCompiler(
         } catch (failure: IllegalArgumentException) {
             diagnostics += Diagnostic("invalid execution policy: ${failure.message}", "$path.policy", map.get<YamlNode>("policy")?.location?.source() ?: node.location.source())
         }
-        return CompiledProvider(providerId, providerVersion, config, input, requestedCapabilities.toSet(), policy)
+        return CompiledProvider(providerId, providerVersion, config, input, requestedCapabilities.toSet(), policy, idempotencyKey)
     }
 
     private fun containsReference(expression: Expression): Boolean = when (expression) {
@@ -1313,16 +1346,7 @@ private object CanonicalIrJson {
             "schema" to schema(register.schema),
             "producer" to expression(register.producer),
         )
-        register.provider?.let { provider ->
-            fields["provider"] = JsonObject(linkedMapOf(
-                "providerId" to JsonPrimitive(provider.providerId),
-                "version" to JsonPrimitive(provider.version),
-                "config" to expression(provider.config),
-                "input" to expression(provider.input),
-                "capabilities" to JsonArray(provider.capabilities.sorted().map(::JsonPrimitive)),
-                "policy" to jsonValue(provider.policy),
-            ))
-        }
+        register.provider?.let { fields["provider"] = provider(it) }
         register.match?.let { fields["match"] = match(it) }
         register.map?.let { fields["map"] = map(it) }
         if (includeSource) fields["source"] = JsonObject(mapOf("line" to JsonPrimitive(register.source.line), "column" to JsonPrimitive(register.source.column)))
@@ -1344,14 +1368,18 @@ private object CanonicalIrJson {
         return JsonObject(fields.toSortedMap())
     }
 
-    private fun provider(provider: CompiledProvider): JsonElement = JsonObject(linkedMapOf(
-        "providerId" to JsonPrimitive(provider.providerId),
-        "version" to JsonPrimitive(provider.version),
-        "config" to expression(provider.config),
-        "input" to expression(provider.input),
-        "capabilities" to JsonArray(provider.capabilities.sorted().map(::JsonPrimitive)),
-        "policy" to jsonValue(provider.policy),
-    ).toSortedMap())
+    private fun provider(provider: CompiledProvider): JsonElement {
+        val fields = linkedMapOf<String, JsonElement>(
+            "providerId" to JsonPrimitive(provider.providerId),
+            "version" to JsonPrimitive(provider.version),
+            "config" to expression(provider.config),
+            "input" to expression(provider.input),
+            "capabilities" to JsonArray(provider.capabilities.sorted().map(::JsonPrimitive)),
+            "policy" to jsonValue(provider.policy),
+        )
+        provider.idempotencyKey?.let { fields["idempotency-key"] = expression(it) }
+        return JsonObject(fields.toSortedMap())
+    }
 
     private fun match(match: CompiledMatch): JsonElement = JsonObject(linkedMapOf(
         "kind" to JsonPrimitive("match"),

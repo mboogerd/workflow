@@ -70,3 +70,25 @@ Emission, failure, and completion ordering from one invocation must be
 unambiguous for protocol validation. The provider stream supplies that order.
 Different invocations remain concurrent, so only accepted journal order defines
 their relative visibility.
+
+## 2026-09-15 — PROVIDER-007: Let the author bind an effect's idempotency key
+
+**Status:** Active
+
+The logical invocation id is derived from workflow execution, context,
+producer, and dependency-revision vector, so a repeated assignment always gets
+a new invocation id and therefore a new default idempotency key. That is
+correct for invocation identity — it is the wrong default whenever two
+different activations, such as two separate runs or two same-day re-cuts of an
+umbrella release, must converge on one external effect (tagging the same Jira
+Fix Version, upserting the same Confluence page).
+
+An author-bindable `idempotency-key` expression on an effect provider producer
+resolves this without weakening invocation identity: it reuses the `with`/
+`config` reference and static-inference machinery, is required and
+string-checked only for effect providers, and is evaluated from the same
+dependency-revision snapshot as `input`/`config`. The provider's reconciliation
+identity becomes an author-controlled function of whatever the workflow
+considers "the same external target" — scoped, in practice, by workflow,
+provider, environment, and that target — rather than an accident of how many
+times a register happened to be reassigned.

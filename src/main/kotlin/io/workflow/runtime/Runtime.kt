@@ -2422,10 +2422,17 @@ class InMemoryWorkflowRunner(
         val config = materialize(evaluate(binding.config, workflow, parameters, context, scope))
         validateProviderBinding(descriptor.inputSchema.validate(input), "provider input")
         validateProviderBinding(descriptor.configurationSchema.validate(config), "provider configuration")
+        val idempotencyKey = binding.idempotencyKey?.let { expression ->
+            when (val evaluated = materialize(evaluate(expression, workflow, parameters, context, scope))) {
+                is Value.StringValue -> evaluated.value
+                else -> throw BindingFailure("idempotency-key must evaluate to a string value")
+            }
+        } ?: invocationId.value
 
         val invocationEventId = invocationCausation ?: recordedInvocation?.eventId ?: recordProviderEvent(
             workflow, intent, invocationId, null, ProviderEventType.INVOCATION,
             causationId = intent.id.value, register = register,
+            value = Value.StringValue(idempotencyKey),
         ).eventId
 
         val implementation = registration.implementation
@@ -2456,7 +2463,7 @@ class InMemoryWorkflowRunner(
             attemptId = attemptId,
             input = input,
             config = config,
-            idempotencyKey = invocationId.value,
+            idempotencyKey = idempotencyKey,
             parentActivationId = intent.parentActivationId,
             discriminatorRevision = intent.discriminatorRevision,
         )
@@ -2855,6 +2862,12 @@ class InMemoryWorkflowRunner(
         val binding = register.provider ?: return ProviderExecutionResult(ProviderActivationStatus.AMBIGUOUS, invocationId, attemptId, diagnostic)
         val registration = providerRegistry.resolve(binding.providerId, binding.version)
         val lifecycle = journal.providerEvents().filter { it.intentId == intent.id }
+        // The external effect was written under the reconciliation identity recorded on the
+        // INVOCATION event, which is the author-bound `idempotency-key` when one is declared.
+        // Journals written before that field existed carry no value and fall back to the
+        // invocation id, which is exactly the identity those effects used.
+        val idempotencyKey = (lifecycle.firstOrNull { it.type == ProviderEventType.INVOCATION }?.value as? Value.StringValue)
+            ?.value ?: invocationId.value
         val latestAttemptIndex = lifecycle.indexOfLast { it.type == ProviderEventType.ATTEMPT_STARTED }
         val latestDecisionIndex = lifecycle.indexOfLast { it.type == ProviderEventType.RECONCILIATION_DECISION }
         val latestDecision = lifecycle.getOrNull(latestDecisionIndex)
@@ -2875,7 +2888,7 @@ class InMemoryWorkflowRunner(
             val requested = recordProviderEvent(
                 workflow, intent, invocationId, attemptId, ProviderEventType.RECONCILIATION_REQUESTED,
                 causationId = invocationEventId, register = register,
-                diagnostic = "RECONCILIATION_REQUEST: formatVersion=1; idempotencyKey=${invocationId.value}; cause=$diagnostic",
+                diagnostic = "RECONCILIATION_REQUEST: formatVersion=1; idempotencyKey=$idempotencyKey; cause=$diagnostic",
             )
             val decision = recordProviderEvent(
                 workflow, intent, invocationId, attemptId, ProviderEventType.RECONCILIATION_DECISION,
@@ -2891,7 +2904,7 @@ class InMemoryWorkflowRunner(
             val requested = recordProviderEvent(
                 workflow, intent, invocationId, attemptId, ProviderEventType.RECONCILIATION_REQUESTED,
                 causationId = invocationEventId, register = register,
-                diagnostic = "RECONCILIATION_REQUEST: formatVersion=1; idempotencyKey=${invocationId.value}; cause=$diagnostic",
+                diagnostic = "RECONCILIATION_REQUEST: formatVersion=1; idempotencyKey=$idempotencyKey; cause=$diagnostic",
             )
             recordProviderEvent(
                 workflow, intent, invocationId, attemptId, ProviderEventType.RECONCILIATION_DECISION,
@@ -2917,6 +2930,7 @@ class InMemoryWorkflowRunner(
                 providerId = binding.providerId,
                 providerVersion = binding.version,
                 invocationId = invocationId,
+                idempotencyKey = idempotencyKey,
                 reconciliationAttemptId = reconciliationAttemptId,
                 attemptId = attemptId,
             )
