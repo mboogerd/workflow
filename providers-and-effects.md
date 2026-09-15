@@ -81,7 +81,9 @@ This is the only way to make two distinct activations — from separate runs, or
 from separate correlated contexts — converge on one external reconciliation
 identity; the key is recorded on the invocation event for replay, inspection,
 and audit. Invocation identity itself is unaffected: two activations with the
-same bound idempotency key still have distinct invocation ids.
+same bound idempotency key still have distinct invocation ids. Reconciliation of
+an ambiguous attempt uses that same recorded key, so a reconciling provider is
+always asked about the identity the external write actually used.
 
 ## Failure and emitted error values
 
